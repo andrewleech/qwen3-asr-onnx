@@ -5,9 +5,13 @@ Exports two separate ONNX graphs:
 - decoder_init: Prefill — processes full input_embeds, outputs logits + KV cache
 - decoder_step: Autoregressive — processes single token + KV cache, outputs logits + updated KV cache
 
-The original text model uses DynamicCache internally and has a torch.jit.is_tracing()
-guard that disables cache creation during tracing. These wrappers construct the cache
-explicitly before calling into the model.
+These wrappers manually iterate through decoder layers, computing attention
+explicitly with plain tensors. This avoids DynamicCache which cannot be traced
+by torch.export.
+
+KV cache is represented as two stacked tensors:
+- past_keys:   [num_layers, batch, kv_heads, seq_len, head_dim]
+- past_values: [num_layers, batch, kv_heads, seq_len, head_dim]
 
 The decoder is Qwen3-0.6B:
     28 layers, d=1024, 16 Q-heads / 8 KV-heads (GQA 2:1), head_dim=128
@@ -16,18 +20,110 @@ The decoder is Qwen3-0.6B:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # Qwen3-0.6B decoder dimensions
 NUM_LAYERS = 28
+NUM_Q_HEADS = 16
 NUM_KV_HEADS = 8
+NUM_KV_GROUPS = NUM_Q_HEADS // NUM_KV_HEADS  # 2
 HEAD_DIM = 128
+
+
+def _rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb(q, k, cos, sin):
+    cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
+    sin = sin.unsqueeze(1)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _repeat_kv(hidden_states, n_rep):
+    """Expand KV heads: [batch, kv_heads, seq, dim] -> [batch, q_heads, seq, dim]."""
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+
+
+def _attention(query, key, value, mask, scaling):
+    """Eager attention with GQA expansion."""
+    key = _repeat_kv(key, NUM_KV_GROUPS)
+    value = _repeat_kv(value, NUM_KV_GROUPS)
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    if mask is not None:
+        attn_weights = attn_weights + mask[:, :, :, : key.shape[-2]]
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_output = torch.matmul(attn_weights, value)
+    return attn_output.transpose(1, 2).contiguous()
+
+
+def _decoder_layer_forward(layer, hidden_states, cos, sin, mask, past_key, past_value):
+    """
+    Run a single decoder layer, returning (hidden_states, key_states, value_states).
+
+    Args:
+        layer: Qwen3 decoder layer module
+        hidden_states: [batch, seq_len, 1024]
+        cos, sin: Rotary position embeddings [batch, seq_len, head_dim]
+        mask: Causal attention mask [batch, 1, q_len, kv_len] or None
+        past_key: [batch, kv_heads, past_seq, head_dim] or None
+        past_value: [batch, kv_heads, past_seq, head_dim] or None
+
+    Returns:
+        (hidden_states, key_states, value_states)
+        key_states/value_states are post-RoPE, concatenated with past if provided
+    """
+    attn = layer.self_attn
+
+    # Input LayerNorm + attention
+    residual = hidden_states
+    normed = layer.input_layernorm(hidden_states)
+
+    # Q/K/V projections
+    input_shape = normed.shape[:-1]  # [batch, seq_len]
+    hidden_shape = (*input_shape, -1, attn.head_dim)
+
+    query_states = attn.q_norm(attn.q_proj(normed).view(hidden_shape)).transpose(1, 2)
+    key_states = attn.k_norm(attn.k_proj(normed).view(hidden_shape)).transpose(1, 2)
+    value_states = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
+
+    # Apply RoPE
+    query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    # Concatenate with past KV if provided (step mode)
+    if past_key is not None:
+        key_states = torch.cat([past_key, key_states], dim=2)
+        value_states = torch.cat([past_value, value_states], dim=2)
+
+    # Attention
+    attn_output = _attention(query_states, key_states, value_states, mask, attn.scaling)
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = attn.o_proj(attn_output)
+
+    hidden_states = residual + attn_output
+
+    # MLP
+    residual = hidden_states
+    normed = layer.post_attention_layernorm(hidden_states)
+    hidden_states = residual + layer.mlp(normed)
+
+    return hidden_states, key_states, value_states
 
 
 class DecoderInitWrapper(nn.Module):
     """
     Decoder prefill: processes full input sequence, returns logits and KV cache.
 
+    Manually iterates through layers to avoid DynamicCache.
     For audio-only ASR, MRoPE degenerates to standard 1D RoPE since all three
     position dimensions (temporal, height, width) receive identical values.
     We accept 1D position_ids and tile to 3D internally.
@@ -35,7 +131,9 @@ class DecoderInitWrapper(nn.Module):
 
     def __init__(self, text_model, lm_head):
         super().__init__()
-        self.text_model = text_model
+        self.layers = text_model.layers
+        self.norm = text_model.norm
+        self.rotary_emb = text_model.rotary_emb
         self.lm_head = lm_head
 
     def forward(
@@ -45,137 +143,112 @@ class DecoderInitWrapper(nn.Module):
     ):
         """
         Args:
-            input_embeds: [batch, seq_len, 1024] — combined text + audio embeddings
-            position_ids: [batch, seq_len] — 1D positions (tiled to 3D for MRoPE)
+            input_embeds: [batch, seq_len, 1024]
+            position_ids: [batch, seq_len]
 
         Returns:
-            Tuple of (logits, *kv_cache_tensors):
+            (logits, present_keys, present_values):
                 logits: [batch, seq_len, vocab_size]
-                kv_cache_tensors: 56 tensors (28 layers x 2 for key/value),
-                    each [batch, num_kv_heads, seq_len, head_dim]
+                present_keys: [num_layers, batch, kv_heads, seq_len, head_dim]
+                present_values: [num_layers, batch, kv_heads, seq_len, head_dim]
         """
+        batch, seq_len = input_embeds.shape[:2]
+
         # Tile position_ids to 3D for MRoPE: [3, batch, seq_len]
         pos_3d = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        seq_len = input_embeds.shape[1]
-        cache_position = torch.arange(seq_len, device=input_embeds.device)
+        # Compute rotary position embeddings (cos, sin)
+        cos, sin = self.rotary_emb(input_embeds, pos_3d)
 
-        # Create a DynamicCache so the model stores KV pairs.
-        # We import here to avoid hard dependency at module load time.
-        from transformers.cache_utils import DynamicCache
-        cache = DynamicCache()
-
-        outputs = self.text_model(
-            inputs_embeds=input_embeds,
-            position_ids=pos_3d,
-            past_key_values=cache,
-            cache_position=cache_position,
-            use_cache=True,
-            return_dict=True,
+        # Create causal attention mask: [1, 1, seq_len, seq_len]
+        causal_mask = torch.full(
+            (seq_len, seq_len), torch.finfo(input_embeds.dtype).min,
+            device=input_embeds.device, dtype=input_embeds.dtype,
         )
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
 
-        logits = self.lm_head(outputs.last_hidden_state)
+        hidden_states = input_embeds
+        all_keys = []
+        all_values = []
 
-        # Extract KV cache tensors from DynamicCache
-        past_kv = outputs.past_key_values
-        result = [logits]
-        for i in range(NUM_LAYERS):
-            result.append(past_kv.key_cache[i])
-            result.append(past_kv.value_cache[i])
+        for layer in self.layers:
+            hidden_states, key_states, value_states = _decoder_layer_forward(
+                layer, hidden_states, cos, sin, causal_mask,
+                past_key=None, past_value=None,
+            )
+            all_keys.append(key_states)
+            all_values.append(value_states)
 
-        return tuple(result)
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+
+        present_keys = torch.stack(all_keys, dim=0)
+        present_values = torch.stack(all_values, dim=0)
+        return logits, present_keys, present_values
 
 
 class DecoderStepWrapper(nn.Module):
     """
     Decoder autoregressive step: processes single new token with KV cache.
+
+    Manually iterates through layers to avoid DynamicCache.
     """
 
     def __init__(self, text_model, lm_head):
         super().__init__()
-        self.text_model = text_model
+        self.layers = text_model.layers
+        self.norm = text_model.norm
+        self.rotary_emb = text_model.rotary_emb
         self.lm_head = lm_head
 
     def forward(
         self,
         input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
-        *past_key_values_flat,
+        past_keys: torch.Tensor,
+        past_values: torch.Tensor,
     ):
         """
         Args:
-            input_embeds: [batch, 1, 1024] — single token embedding
-            position_ids: [batch, 1] — position of this token
-            past_key_values_flat: 56 tensors — flattened KV cache from previous steps
-                (layer0_key, layer0_value, layer1_key, layer1_value, ...)
+            input_embeds: [batch, 1, 1024]
+            position_ids: [batch, 1]
+            past_keys: [num_layers, batch, kv_heads, past_seq, head_dim]
+            past_values: [num_layers, batch, kv_heads, past_seq, head_dim]
 
         Returns:
-            Tuple of (logits, *updated_kv_cache):
+            (logits, present_keys, present_values):
                 logits: [batch, 1, vocab_size]
-                updated_kv_cache: 56 tensors with seq_len extended by 1
+                present_keys: [num_layers, batch, kv_heads, past_seq+1, head_dim]
+                present_values: [num_layers, batch, kv_heads, past_seq+1, head_dim]
         """
         # Tile position_ids to 3D for MRoPE
         pos_3d = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        # Reconstruct DynamicCache from flat tensors
-        from transformers.cache_utils import DynamicCache
-        cache = DynamicCache()
-        for i in range(NUM_LAYERS):
-            cache.key_cache.append(past_key_values_flat[i * 2])
-            cache.value_cache.append(past_key_values_flat[i * 2 + 1])
+        # Compute rotary embeddings for current position only
+        cos, sin = self.rotary_emb(input_embeds, pos_3d)
 
-        # cache_position tells the model where this step is in the sequence
-        past_len = past_key_values_flat[0].shape[2]
-        cache_position = torch.arange(
-            past_len, past_len + 1, device=input_embeds.device
-        )
+        # No causal mask needed for single-token query (attends to all past + self)
+        mask = None
 
-        outputs = self.text_model(
-            inputs_embeds=input_embeds,
-            position_ids=pos_3d,
-            past_key_values=cache,
-            cache_position=cache_position,
-            use_cache=True,
-            return_dict=True,
-        )
+        hidden_states = input_embeds
+        all_keys = []
+        all_values = []
 
-        logits = self.lm_head(outputs.last_hidden_state)
+        for i, layer in enumerate(self.layers):
+            hidden_states, key_states, value_states = _decoder_layer_forward(
+                layer, hidden_states, cos, sin, mask,
+                past_key=past_keys[i], past_value=past_values[i],
+            )
+            all_keys.append(key_states)
+            all_values.append(value_states)
 
-        # Extract updated KV cache
-        past_kv = outputs.past_key_values
-        result = [logits]
-        for i in range(NUM_LAYERS):
-            result.append(past_kv.key_cache[i])
-            result.append(past_kv.value_cache[i])
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
 
-        return tuple(result)
-
-
-def _kv_input_names():
-    """Generate ONNX input names for KV cache tensors."""
-    names = []
-    for i in range(NUM_LAYERS):
-        names.append(f"past_key_{i}")
-        names.append(f"past_value_{i}")
-    return names
-
-
-def _kv_output_names():
-    """Generate ONNX output names for KV cache tensors."""
-    names = []
-    for i in range(NUM_LAYERS):
-        names.append(f"present_key_{i}")
-        names.append(f"present_value_{i}")
-    return names
-
-
-def _kv_dynamic_axes(prefix: str, seq_dim_name: str):
-    """Generate dynamic axes for KV cache tensors."""
-    axes = {}
-    for i in range(NUM_LAYERS):
-        axes[f"{prefix}_key_{i}"] = {0: "batch", 2: seq_dim_name}
-        axes[f"{prefix}_value_{i}"] = {0: "batch", 2: seq_dim_name}
-    return axes
+        present_keys = torch.stack(all_keys, dim=0)
+        present_values = torch.stack(all_values, dim=0)
+        return logits, present_keys, present_values
 
 
 def export_decoder_init(
@@ -186,9 +259,6 @@ def export_decoder_init(
 ):
     """
     Export the decoder prefill graph to ONNX.
-
-    If standard tracing fails (due to DynamicCache or vmap issues), this
-    function falls back to torch.onnx.export with dynamo_export=True.
 
     Args:
         model: Loaded Qwen3ASRForConditionalGeneration model.
@@ -206,41 +276,27 @@ def export_decoder_init(
     dummy_pos = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
 
     input_names = ["input_embeds", "position_ids"]
-    output_names = ["logits"] + _kv_output_names()
+    output_names = ["logits", "present_keys", "present_values"]
 
     dynamic_axes = {
         "input_embeds": {0: "batch", 1: "seq_len"},
         "position_ids": {0: "batch", 1: "seq_len"},
         "logits": {0: "batch", 1: "seq_len"},
+        "present_keys": {1: "batch", 3: "seq_len"},
+        "present_values": {1: "batch", 3: "seq_len"},
     }
-    dynamic_axes.update(_kv_dynamic_axes("present", "seq_len"))
 
     with torch.no_grad():
-        try:
-            torch.onnx.export(
-                wrapper,
-                (dummy_embeds, dummy_pos),
-                output_path,
-                input_names=input_names,
-                output_names=output_names,
-                dynamic_axes=dynamic_axes,
-                opset_version=opset_version,
-                do_constant_folding=True,
-            )
-        except Exception as e:
-            print(f"Standard ONNX export failed: {e}")
-            print("Attempting export with dynamo backend...")
-            torch.onnx.export(
-                wrapper,
-                (dummy_embeds, dummy_pos),
-                output_path,
-                input_names=input_names,
-                output_names=output_names,
-                dynamic_axes=dynamic_axes,
-                opset_version=opset_version,
-                do_constant_folding=True,
-                dynamo=True,
-            )
+        torch.onnx.export(
+            wrapper,
+            (dummy_embeds, dummy_pos),
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=opset_version,
+            do_constant_folding=True,
+        )
 
     print(f"Decoder init exported to {output_path}")
 
@@ -269,50 +325,35 @@ def export_decoder_step(
     dummy_embeds = torch.randn(1, 1, 1024, device=device, dtype=torch.float32)
     dummy_pos = torch.tensor([[past_seq_len]], device=device, dtype=torch.long)
 
-    # Dummy KV cache: 56 tensors
-    dummy_kv = []
-    for _ in range(NUM_LAYERS):
-        dummy_kv.append(torch.randn(1, NUM_KV_HEADS, past_seq_len, HEAD_DIM, device=device, dtype=torch.float32))
-        dummy_kv.append(torch.randn(1, NUM_KV_HEADS, past_seq_len, HEAD_DIM, device=device, dtype=torch.float32))
+    # Stacked KV cache: [num_layers, batch, kv_heads, past_seq, head_dim]
+    dummy_past_keys = torch.randn(NUM_LAYERS, 1, NUM_KV_HEADS, past_seq_len, HEAD_DIM, device=device, dtype=torch.float32)
+    dummy_past_values = torch.randn(NUM_LAYERS, 1, NUM_KV_HEADS, past_seq_len, HEAD_DIM, device=device, dtype=torch.float32)
 
-    input_names = ["input_embeds", "position_ids"] + _kv_input_names()
-    output_names = ["logits"] + _kv_output_names()
+    input_names = ["input_embeds", "position_ids", "past_keys", "past_values"]
+    output_names = ["logits", "present_keys", "present_values"]
 
     dynamic_axes = {
         "input_embeds": {0: "batch"},
         "position_ids": {0: "batch"},
+        "past_keys": {1: "batch", 3: "past_seq_len"},
+        "past_values": {1: "batch", 3: "past_seq_len"},
         "logits": {0: "batch"},
+        "present_keys": {1: "batch", 3: "total_seq_len"},
+        "present_values": {1: "batch", 3: "total_seq_len"},
     }
-    dynamic_axes.update(_kv_dynamic_axes("past", "past_seq_len"))
-    dynamic_axes.update(_kv_dynamic_axes("present", "total_seq_len"))
 
-    args = (dummy_embeds, dummy_pos, *dummy_kv)
+    args = (dummy_embeds, dummy_pos, dummy_past_keys, dummy_past_values)
 
     with torch.no_grad():
-        try:
-            torch.onnx.export(
-                wrapper,
-                args,
-                output_path,
-                input_names=input_names,
-                output_names=output_names,
-                dynamic_axes=dynamic_axes,
-                opset_version=opset_version,
-                do_constant_folding=True,
-            )
-        except Exception as e:
-            print(f"Standard ONNX export failed: {e}")
-            print("Attempting export with dynamo backend...")
-            torch.onnx.export(
-                wrapper,
-                args,
-                output_path,
-                input_names=input_names,
-                output_names=output_names,
-                dynamic_axes=dynamic_axes,
-                opset_version=opset_version,
-                do_constant_folding=True,
-                dynamo=True,
-            )
+        torch.onnx.export(
+            wrapper,
+            args,
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=opset_version,
+            do_constant_folding=True,
+        )
 
     print(f"Decoder step exported to {output_path}")

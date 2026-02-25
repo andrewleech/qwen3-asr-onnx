@@ -31,12 +31,22 @@ from src.prompt import (
 
 def load_pytorch_model(model_id: str, device: str = "cpu"):
     """Load the PyTorch model for reference."""
-    model = AutoModel.from_pretrained(
-        model_id,
-        torch_dtype=torch.float32,
-        device_map=device,
-        trust_remote_code=True,
-    )
+    try:
+        model = AutoModel.from_pretrained(
+            model_id,
+            torch_dtype=torch.float32,
+            device_map=device,
+            trust_remote_code=True,
+        )
+    except Exception:
+        from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+            Qwen3ASRForConditionalGeneration,
+        )
+        model = Qwen3ASRForConditionalGeneration.from_pretrained(
+            model_id,
+            torch_dtype=torch.float32,
+            device_map=device,
+        )
     model.eval()
     return model
 
@@ -91,42 +101,39 @@ def run_encoder_pytorch(model, mel: torch.Tensor) -> torch.Tensor:
 
 
 def run_decoder_init_onnx(session, input_embeds: np.ndarray, position_ids: np.ndarray):
-    """Run decoder prefill through ONNX Runtime."""
+    """Run decoder prefill through ONNX Runtime.
+
+    Returns:
+        (logits, present_keys, present_values)
+        Keys/values are stacked: [num_layers, batch, kv_heads, seq_len, head_dim]
+    """
     inputs = {
         "input_embeds": input_embeds,
         "position_ids": position_ids,
     }
-    output_names = [o.name for o in session.get_outputs()]
-    results = session.run(output_names, inputs)
-
-    logits = results[0]
-    kv_cache = {}
-    for i, name in enumerate(output_names[1:], 1):
-        kv_cache[name] = results[i]
-
-    return logits, kv_cache
+    logits, present_keys, present_values = session.run(
+        ["logits", "present_keys", "present_values"], inputs
+    )
+    return logits, present_keys, present_values
 
 
-def run_decoder_step_onnx(session, input_embeds: np.ndarray, position_ids: np.ndarray, kv_cache: dict):
-    """Run decoder step through ONNX Runtime."""
+def run_decoder_step_onnx(session, input_embeds: np.ndarray, position_ids: np.ndarray,
+                          past_keys: np.ndarray, past_values: np.ndarray):
+    """Run decoder step through ONNX Runtime.
+
+    Returns:
+        (logits, present_keys, present_values)
+    """
     inputs = {
         "input_embeds": input_embeds,
         "position_ids": position_ids,
+        "past_keys": past_keys,
+        "past_values": past_values,
     }
-    # Map present_key/value from init to past_key/value for step
-    for name, value in kv_cache.items():
-        step_name = name.replace("present_", "past_")
-        inputs[step_name] = value
-
-    output_names = [o.name for o in session.get_outputs()]
-    results = session.run(output_names, inputs)
-
-    logits = results[0]
-    new_kv_cache = {}
-    for i, name in enumerate(output_names[1:], 1):
-        new_kv_cache[name] = results[i]
-
-    return logits, new_kv_cache
+    logits, present_keys, present_values = session.run(
+        ["logits", "present_keys", "present_values"], inputs
+    )
+    return logits, present_keys, present_values
 
 
 def greedy_decode_onnx(
@@ -161,7 +168,7 @@ def greedy_decode_onnx(
     position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]  # [1, seq_len]
 
     # Prefill
-    logits, kv_cache = run_decoder_init_onnx(
+    logits, present_keys, present_values = run_decoder_init_onnx(
         sessions["decoder_init"], input_embeds, position_ids
     )
 
@@ -178,8 +185,8 @@ def greedy_decode_onnx(
         token_embed = embed_tokens[next_token][np.newaxis, np.newaxis, :]  # [1, 1, 1024]
         step_pos = np.array([[pos]], dtype=np.int64)
 
-        logits, kv_cache = run_decoder_step_onnx(
-            sessions["decoder_step"], token_embed, step_pos, kv_cache
+        logits, present_keys, present_values = run_decoder_step_onnx(
+            sessions["decoder_step"], token_embed, step_pos, present_keys, present_values
         )
 
         next_token = int(np.argmax(logits[0, -1, :]))

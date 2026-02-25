@@ -13,29 +13,76 @@ import argparse
 import json
 import os
 import shutil
+import tempfile
 
 import numpy as np
+import onnx
 from onnxruntime.quantization import quantize_dynamic, QuantType
 
 
 ONNX_FILES = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"]
 
 
+def _total_size(path: str) -> int:
+    """Get total size of an ONNX model including external data."""
+    size = os.path.getsize(path)
+    data_path = path + ".data"
+    if os.path.exists(data_path):
+        size += os.path.getsize(data_path)
+    return size
+
+
+def _simplify_if_needed(input_path: str) -> str:
+    """Try to simplify the model with onnxsim to fix shape inference issues.
+
+    Returns the path to use for quantization (temp file if simplified, original otherwise).
+    """
+    try:
+        import onnxsim
+        model = onnx.load(input_path, load_external_data=True)
+        model_sim, ok = onnxsim.simplify(model)
+        if ok:
+            tmpfile = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)
+            onnx.save(model_sim, tmpfile.name)
+            print(f"    Simplified for shape inference compatibility")
+            return tmpfile.name
+    except Exception:
+        pass
+    return input_path
+
+
 def quantize_onnx_file(input_path: str, output_path: str):
     """Apply INT8 dynamic quantization to an ONNX file."""
     print(f"  Quantizing {os.path.basename(input_path)}...")
 
-    quantize_dynamic(
-        input_path,
-        output_path,
-        weight_type=QuantType.QInt8,
-    )
+    # Try direct quantization first, fall back to simplification
+    tmp_path = None
+    try:
+        quantize_dynamic(
+            input_path,
+            output_path,
+            weight_type=QuantType.QInt8,
+            use_external_data_format=True,
+        )
+    except Exception:
+        # Shape inference may fail on dynamo-exported models; simplify first
+        print(f"    Direct quantization failed, trying with onnxsim...")
+        tmp_path = _simplify_if_needed(input_path)
+        quantize_dynamic(
+            tmp_path,
+            output_path,
+            weight_type=QuantType.QInt8,
+            use_external_data_format=True,
+        )
 
-    input_size = os.path.getsize(input_path)
-    output_size = os.path.getsize(output_path)
-    ratio = output_size / input_size
+    if tmp_path and tmp_path != input_path:
+        os.unlink(tmp_path)
+
+    in_size = _total_size(input_path)
+    out_size = _total_size(output_path)
+    ratio = out_size / in_size
     print(
-        f"    {input_size / 1e6:.1f} MB -> {output_size / 1e6:.1f} MB "
+        f"    {in_size / 1e6:.1f} MB -> {out_size / 1e6:.1f} MB "
         f"({ratio:.1%})"
     )
 
@@ -88,7 +135,7 @@ def main():
 
     # Copy non-quantized files
     print("\nCopying config and tokenizer...")
-    for filename in ["tokenizer.json", "tokenizer_config.json"]:
+    for filename in ["tokenizer.json", "tokenizer_config.json", "added_tokens.json", "vocab.json"]:
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(args.output, filename))
