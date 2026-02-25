@@ -1,24 +1,19 @@
 """
 Wrapper module for Qwen3-ASR audio encoder export to ONNX.
 
-The original audio tower processes mel spectrograms per-chunk with dynamic
-shapes, boolean mask indexing, and windowed attention via cu_seqlens. These
-operations don't trace cleanly with torch.onnx.export.
+Reimplements the native encoder's windowed convolution and windowed attention
+using trace-friendly operations (no cu_seqlens, no boolean mask indexing,
+no dynamic splitting, no data-dependent branching).
 
-This wrapper reimplements the encoder forward pass using trace-friendly
-operations:
-  1. Full-sequence Conv2D (no per-chunk splitting)
-  2. Full bidirectional attention (no windowing)
-  3. Static shapes throughout
-
-NOTE: This produces identical output to the original encoder for audio
-shorter than ~13 seconds (one attention window = 104 tokens at 12.5Hz).
-For longer audio, windowed attention would give different results — this
-wrapper uses full attention which may produce slightly different outputs
-at window boundaries.
+Processing stages:
+  1. Windowed Conv2D: pad mel to multiple of 100, batch-convolve
+  2. Positional embeddings per window (positions 0..12)
+  3. Flatten, pad to multiple of 104 (attention window), reshape to batched windows
+  4. Batched bidirectional attention through transformer layers
+  5. Flatten, trim to valid_count, project
 
 Input: mel spectrogram [1, 128, time]
-Output: audio features [1, time/8, 1024]
+Output: audio features [1, tokens, 1024]
 """
 
 import math
@@ -28,91 +23,182 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# 0.6B encoder dimensions
+NUM_HEADS = 14
+HEAD_DIM = 64
+D_MODEL = 896
+CONV_WINDOW = 100       # n_window * 2
+TOKENS_PER_WINDOW = 13  # tokens output by conv on a full 100-frame window
+ATTN_WINDOW_SIZE = 104  # TOKENS_PER_WINDOW * (n_window_infer // conv_window) = 13 * 8
+
+
+def _conv_out_len(t):
+    """Output length after one stride-2 conv (kernel=3, padding=1).
+
+    Equivalent to (t - 1) // 2 + 1 for t >= 1 and 0 for t = 0.
+    Uses (t + 1) // 2 to avoid negative intermediate values, which
+    would give wrong results in ONNX (truncation-toward-zero division).
+    """
+    return (t + 1) // 2
+
+
+def _get_feat_extract_output_lengths(input_lengths):
+    """Number of encoder tokens from mel frame count.
+
+    Matches the native Qwen3-ASR formula. Uses _conv_out_len instead of
+    (x - 1) // 2 + 1 to be safe under ONNX integer division semantics.
+    """
+    leave = input_lengths % CONV_WINDOW
+    t = _conv_out_len(leave)
+    t = _conv_out_len(t)
+    t = _conv_out_len(t)
+    return t + (input_lengths // CONV_WINDOW) * TOKENS_PER_WINDOW
+
+
+def _encoder_attention(q, k, v, mask, scaling):
+    """
+    Batched bidirectional attention with additive mask.
+
+    Args:
+        q, k, v: [batch, num_heads, seq, head_dim]
+        mask: [batch, 1, 1, seq] additive mask (-inf for padding)
+        scaling: float
+    Returns:
+        [batch, seq, num_heads * head_dim]
+    """
+    attn_weights = torch.matmul(q, k.transpose(2, 3)) * scaling
+    attn_weights = attn_weights + mask
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+    out = torch.matmul(attn_weights, v)
+    return out.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
+
+
+def _encoder_layer_forward(layer, x, attn_mask, scaling):
+    """
+    Single encoder layer forward with batched 3D input.
+
+    Args:
+        layer: Qwen3ASRAudioEncoderLayer
+        x: [batch, seq, d_model]
+        attn_mask: [batch, 1, 1, seq] additive mask
+        scaling: float
+
+    Returns:
+        [batch, seq, d_model]
+    """
+    sa = layer.self_attn
+    batch, seq, _ = x.shape
+
+    residual = x
+    normed = layer.self_attn_layer_norm(x)
+
+    q = sa.q_proj(normed).view(batch, seq, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+    k = sa.k_proj(normed).view(batch, seq, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+    v = sa.v_proj(normed).view(batch, seq, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+
+    attn_out = _encoder_attention(q, k, v, attn_mask, scaling)
+    attn_out = sa.out_proj(attn_out)
+    x = residual + attn_out
+
+    residual = x
+    normed = layer.final_layer_norm(x)
+    x = residual + layer.fc2(F.gelu(layer.fc1(normed)))
+
+    return x
+
+
 class EncoderWrapper(nn.Module):
     """
-    Reimplements the Qwen3ASRAudioEncoder forward pass for ONNX export.
+    Reimplements the Qwen3ASRAudioEncoder forward pass with windowed
+    convolution and windowed attention, using ONNX-traceable operations.
 
-    Extracts submodules from the original audio tower and chains them
-    in a trace-friendly manner.
+    All control flow is branch-free (no data-dependent if/else) to ensure
+    correct tracing under torch.export / torch.onnx.export.
     """
 
     def __init__(self, audio_tower):
         super().__init__()
-        # Conv2D stem (3 layers with stride 2 each -> 8x downsample)
         self.conv2d1 = audio_tower.conv2d1
         self.conv2d2 = audio_tower.conv2d2
         self.conv2d3 = audio_tower.conv2d3
-        self.conv_out = audio_tower.conv_out  # Linear(7680, d_model=896)
-
-        # Sinusoidal position embedding module
-        # forward(seqlen: int) -> [seqlen, 896] from a pre-computed buffer
+        self.conv_out = audio_tower.conv_out
         self.positional_embedding = audio_tower.positional_embedding
-
-        # Transformer encoder layers — force eager attention for ONNX export
-        # (SDPA with enable_gqa=True fails in the ONNX converter)
         self.layers = audio_tower.layers
-        for layer in self.layers:
-            layer.self_attn.config._attn_implementation = "eager"
-
-        # Post-LayerNorm
         self.ln_post = audio_tower.ln_post
-
-        # Projector (d_model -> output_dim)
-        self.proj1 = audio_tower.proj1  # Linear(896, 896)
-        self.proj2 = audio_tower.proj2  # Linear(896, 1024)
-
-        # Activation function (GELUActivation from the model)
+        self.proj1 = audio_tower.proj1
+        self.proj2 = audio_tower.proj2
         self.act = audio_tower.act
+        self.scaling = self.layers[0].self_attn.scaling
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            mel: Log-mel spectrogram [1, 128, time]. Batch=1 only.
-                 Time should be divisible by 8 for clean downsampling.
+            mel: [1, 128, T] log-mel spectrogram.
 
         Returns:
-            Audio features [1, time/8, 1024].
+            [1, valid_count, 1024] audio features.
         """
-        # mel: [1, 128, T] -> add channel dim for Conv2D: [1, 1, 128, T]
-        x = mel.unsqueeze(1)
+        T = mel.shape[2]
 
-        # Conv2D stem: 3 layers with stride=2, GELU activation
-        # [1, 1, 128, T] -> [1, 480, 64, T/2] -> [1, 480, 32, T/4] -> [1, 480, 16, T/8]
+        # --- Stage 1: Windowed Conv2D ---
+        # Pad T to next multiple of CONV_WINDOW (no-op when already aligned)
+        pad_amount = (CONV_WINDOW - T % CONV_WINDOW) % CONV_WINDOW
+        mel = F.pad(mel, (0, pad_amount))
+        T_padded = mel.shape[2]
+        num_conv_windows = T_padded // CONV_WINDOW
+
+        # [1, 128, T_padded] -> [N, 1, 128, CONV_WINDOW]
+        x = mel.squeeze(0)                                     # [128, T_padded]
+        x = x.reshape(128, num_conv_windows, CONV_WINDOW)      # [128, N, 100]
+        x = x.permute(1, 0, 2)                                 # [N, 128, 100]
+        x = x.unsqueeze(1)                                     # [N, 1, 128, 100]
+
+        # Conv2D stem
         x = F.gelu(self.conv2d1(x))
         x = F.gelu(self.conv2d2(x))
         x = F.gelu(self.conv2d3(x))
 
-        # Reshape: [1, 480, 16, T/8] -> [1, T/8, 480*16] = [1, T/8, 7680]
-        batch, channels, freq, time = x.shape
-        x = x.permute(0, 3, 1, 2)  # [1, T/8, 480, 16]
-        x = x.reshape(batch, time, channels * freq)  # [1, T/8, 7680]
-
-        # Linear projection: [1, T/8, 7680] -> [1, T/8, 896]
+        # [N, 480, 16, tokens_per_window] -> [N, tokens_per_window, 7680] -> [N, tpw, 896]
+        b, c, f, t = x.shape
+        x = x.permute(0, 3, 1, 2).reshape(b, t, c * f)
         x = self.conv_out(x)
 
-        # Add sinusoidal position embeddings
-        seq_len = x.shape[1]
-        pos_embed = self.positional_embedding(seq_len)  # [seq_len, 896]
+        # Per-window positional embeddings (same positions 0..tpw-1 for every window)
+        pos_embed = self.positional_embedding(t)  # [tpw, 896]
         x = x + pos_embed.unsqueeze(0)
 
-        # Transformer encoder layers (full bidirectional attention)
-        # Layers expect 2D input (seq_len, embed_dim) and cu_seqlens for attention.
-        # For a single contiguous sequence, cu_seqlens = [0, seq_len].
-        x = x.squeeze(0)  # [seq_len, 896]
-        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=x.device)
+        # --- Stage 2: Flatten and compute valid_count ---
+        valid_count = _get_feat_extract_output_lengths(T)
+        flat = x.reshape(-1, D_MODEL)     # [N * tpw, 896]
+        flat = flat[:valid_count]          # trim conv-padding tokens
+
+        # --- Stage 3: Pad to multiple of ATTN_WINDOW_SIZE, reshape to windows ---
+        attn_pad = (ATTN_WINDOW_SIZE - valid_count % ATTN_WINDOW_SIZE) % ATTN_WINDOW_SIZE
+        flat = F.pad(flat, (0, 0, 0, attn_pad))  # no-op when attn_pad=0
+        total_padded = valid_count + attn_pad
+        num_attn_windows = total_padded // ATTN_WINDOW_SIZE
+        x = flat.reshape(num_attn_windows, ATTN_WINDOW_SIZE, D_MODEL)
+
+        # --- Stage 4: Attention mask (branch-free) ---
+        # Global position for each element; positions >= valid_count are padding
+        positions = torch.arange(total_padded, device=mel.device)
+        positions = positions.reshape(num_attn_windows, ATTN_WINDOW_SIZE)
+        pad_mask = (positions >= valid_count).to(mel.dtype) * torch.finfo(mel.dtype).min
+        attn_mask = pad_mask.unsqueeze(1).unsqueeze(1)  # [num_windows, 1, 1, ATTN_WINDOW_SIZE]
+
+        # --- Stage 5: Transformer layers ---
         for layer in self.layers:
-            layer_out = layer(x, cu_seqlens=cu_seqlens, attention_mask=None)
-            x = layer_out[0]
-        x = x.unsqueeze(0)  # [1, seq_len, 896]
+            x = _encoder_layer_forward(layer, x, attn_mask, self.scaling)
 
-        # Post-LayerNorm
+        # --- Stage 6: Flatten, trim, project ---
+        x = x.reshape(-1, D_MODEL)[:valid_count]
+        x = x.unsqueeze(0)  # [1, valid_count, 896]
+
         x = self.ln_post(x)
-
-        # Projector: 896 -> 896 (GELU) -> 1024
         x = self.act(self.proj1(x))
         x = self.proj2(x)
 
-        return x  # [1, T/8, 1024]
+        return x  # [1, valid_count, 1024]
 
 
 def export_encoder(
@@ -121,37 +207,20 @@ def export_encoder(
     opset_version: int = 17,
     device: str = "cpu",
 ):
-    """
-    Export the audio encoder to ONNX.
-
-    This function:
-    1. Creates an EncoderWrapper that reimplements the forward pass
-    2. Verifies the wrapper output matches the original model
-    3. Exports to ONNX
-
-    Args:
-        model: Loaded Qwen3ASRForConditionalGeneration model.
-        output_path: Path to save the .onnx file.
-        opset_version: ONNX opset version.
-        device: Device for tracing.
-    """
+    """Export the audio encoder to ONNX."""
     audio_tower = model.thinker.audio_tower
     wrapper = EncoderWrapper(audio_tower).eval().to(device)
 
-    # Dummy input: ~10 seconds of audio -> 1000 mel frames
-    # Using a shorter trace input for faster export; dynamic axes handle variable lengths
-    dummy_mel = torch.randn(1, 128, 1000, device=device, dtype=torch.float32)
+    # Use non-round frame count to exercise padding code during tracing
+    dummy_mel = torch.randn(1, 128, 997, device=device, dtype=torch.float32)
 
-    # Verify wrapper output is reasonable (shape check)
     with torch.no_grad():
         test_output = wrapper(dummy_mel)
-        expected_time = dummy_mel.shape[2] // 8
-        assert test_output.shape == (1, expected_time, 1024), (
-            f"Wrapper output shape {test_output.shape} != expected (1, {expected_time}, 1024). "
-            "The encoder architecture may have changed — check submodule access."
+        expected_tokens = _get_feat_extract_output_lengths(997)
+        assert test_output.shape == (1, expected_tokens, 1024), (
+            f"Shape {test_output.shape} != expected (1, {expected_tokens}, 1024)"
         )
 
-    # Export
     with torch.no_grad():
         torch.onnx.export(
             wrapper,

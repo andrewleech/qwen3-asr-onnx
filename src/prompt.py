@@ -25,12 +25,34 @@ EOS_TOKEN_IDS = [ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID]
 NEWLINE_TOKEN_ID = 198
 
 
+def get_feat_extract_output_lengths(input_lengths: int) -> int:
+    """
+    Compute the number of audio tokens the encoder produces from a given mel frame count.
+
+    This matches the native Qwen3-ASR windowed convolution output length formula.
+    Each full 100-frame window produces 13 tokens. A partial tail window produces
+    fewer tokens based on the 3x stride-2 conv stack.
+
+    Args:
+        input_lengths: Number of mel spectrogram frames (time dimension).
+
+    Returns:
+        Number of encoder output tokens.
+    """
+    input_lengths_leave = input_lengths % 100
+    feat_lengths = (input_lengths_leave - 1) // 2 + 1
+    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+    return output_lengths
+
+
 def build_prompt_ids(audio_token_count: int, language: str | None = None) -> list[int]:
     """
     Build the full prompt token ID sequence for ASR transcription.
 
     Args:
-        audio_token_count: Number of encoder output tokens (= mel_frames / 8).
+        audio_token_count: Number of encoder output tokens. Use
+            get_feat_extract_output_lengths(mel_frames) to compute this
+            from mel frame count.
             This determines how many <|audio_pad|> tokens are inserted.
         language: Optional language name to force (e.g. "English"). If provided,
             the assistant prefix becomes "language {name}<asr_text>".

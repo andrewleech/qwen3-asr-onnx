@@ -80,4 +80,7 @@ def log_mel_spectrogram(
     log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
     log_spec = (log_spec + 4.0) / 4.0
 
+    # Drop last STFT frame to match WhisperFeatureExtractor behavior
+    log_spec = log_spec[:, :-1]
+
     return log_spec.unsqueeze(0)  # [1, n_mels, time]
