@@ -1,0 +1,16 @@
+output/
+__pycache__/
+*.onnx
+*.onnx.data
+*.bin
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.env
+research_notes.md
