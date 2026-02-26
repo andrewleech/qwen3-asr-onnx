@@ -245,4 +245,6 @@ def export_encoder(
             do_constant_folding=True,
         )
 
-    print(f"Encoder exported to {output_path}")
+    from .onnx_fixup import fix_reshape_allowzero
+    n = fix_reshape_allowzero(output_path)
+    print(f"Encoder exported to {output_path} (fixed {n} Reshape allowzero attrs)")

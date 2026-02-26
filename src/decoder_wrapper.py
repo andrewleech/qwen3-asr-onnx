@@ -301,7 +301,9 @@ def export_decoder_init(
             do_constant_folding=True,
         )
 
-    print(f"Decoder init exported to {output_path}")
+    from .onnx_fixup import fix_reshape_allowzero
+    n = fix_reshape_allowzero(output_path)
+    print(f"Decoder init exported to {output_path} (fixed {n} Reshape allowzero attrs)")
 
 
 def export_decoder_step(
@@ -365,4 +367,6 @@ def export_decoder_step(
             do_constant_folding=True,
         )
 
-    print(f"Decoder step exported to {output_path}")
+    from .onnx_fixup import fix_reshape_allowzero
+    n = fix_reshape_allowzero(output_path)
+    print(f"Decoder step exported to {output_path} (fixed {n} Reshape allowzero attrs)")
