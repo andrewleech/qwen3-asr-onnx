@@ -23,14 +23,21 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def pytorch_model():
-    from transformers import AutoModel
-
-    model = AutoModel.from_pretrained(
-        "Qwen/Qwen3-ASR-0.6B",
-        torch_dtype=torch.float32,
-        device_map="cpu",
-        trust_remote_code=True,
-    )
+    try:
+        from transformers import AutoModel
+        model = AutoModel.from_pretrained(
+            "Qwen/Qwen3-ASR-0.6B",
+            torch_dtype=torch.float32,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+    except Exception:
+        from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+            Qwen3ASRForConditionalGeneration,
+        )
+        model = Qwen3ASRForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen3-ASR-0.6B", torch_dtype=torch.float32, device_map="cpu",
+        )
     model.eval()
     return model
 
@@ -65,14 +72,20 @@ def test_mel():
 
 class TestEncoderExport:
     def test_output_shape(self, onnx_session, test_mel):
-        """Encoder output shape should be [batch, time/8, 1024]."""
+        """Encoder output shape should match windowed token count formula."""
+        from src.encoder_wrapper import _get_feat_extract_output_lengths
+
         mel_np = test_mel.numpy()
         result = onnx_session.run(["audio_features"], {"mel": mel_np})
         features = result[0]
 
+        T = mel_np.shape[2]
+        expected_tokens = _get_feat_extract_output_lengths(T)
+
         assert features.ndim == 3
-        assert features.shape[0] == 1  # batch
-        assert features.shape[2] == 1024  # output_dim
+        assert features.shape == (1, expected_tokens, 1024), (
+            f"Shape {features.shape} != expected (1, {expected_tokens}, 1024) for T={T}"
+        )
 
     def test_pytorch_onnx_match(self, pytorch_model, onnx_session, test_mel):
         """ONNX output should match PyTorch output within tolerance."""
@@ -103,6 +116,19 @@ class TestEncoderExport:
             features = result[0]
             assert features.shape[0] == 1
             assert features.shape[2] == 1024
+
+    def test_token_count_formula(self, onnx_session):
+        """ONNX encoder output length should match the windowed token count formula."""
+        from src.encoder_wrapper import _get_feat_extract_output_lengths
+
+        for n_frames in [800, 997, 1000, 1600, 3000]:
+            mel = np.random.randn(1, 128, n_frames).astype(np.float32)
+            result = onnx_session.run(["audio_features"], {"mel": mel})
+            features = result[0]
+            expected = _get_feat_extract_output_lengths(n_frames)
+            assert features.shape[1] == expected, (
+                f"T={n_frames}: got {features.shape[1]} tokens, expected {expected}"
+            )
 
     def test_single_batch(self, onnx_session):
         """Encoder processes batch=1 (original model doesn't support batch>1)."""

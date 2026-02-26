@@ -26,23 +26,13 @@ NEWLINE_TOKEN_ID = 198
 
 
 def get_feat_extract_output_lengths(input_lengths: int) -> int:
+    """Compute the number of audio tokens the encoder produces from a given mel frame count.
+
+    Delegates to encoder_wrapper._get_feat_extract_output_lengths which uses
+    ONNX-safe integer division.
     """
-    Compute the number of audio tokens the encoder produces from a given mel frame count.
-
-    This matches the native Qwen3-ASR windowed convolution output length formula.
-    Each full 100-frame window produces 13 tokens. A partial tail window produces
-    fewer tokens based on the 3x stride-2 conv stack.
-
-    Args:
-        input_lengths: Number of mel spectrogram frames (time dimension).
-
-    Returns:
-        Number of encoder output tokens.
-    """
-    input_lengths_leave = input_lengths % 100
-    feat_lengths = (input_lengths_leave - 1) // 2 + 1
-    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-    return output_lengths
+    from src.encoder_wrapper import _get_feat_extract_output_lengths
+    return _get_feat_extract_output_lengths(input_lengths)
 
 
 def build_prompt_ids(audio_token_count: int, language: str | None = None) -> list[int]:

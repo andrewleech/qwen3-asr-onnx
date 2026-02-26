@@ -1,0 +1,59 @@
+# Test Audio Fixtures
+
+All files are 16kHz mono WAV. Tracked with Git LFS.
+
+## Files
+
+### test_audio.wav
+
+- **Duration**: 5.0s (80,000 samples)
+- **Source**: Generated test fixture
+- **Format**: PCM 16-bit
+
+### librispeech_0.wav
+
+- **Duration**: 5.9s (93,680 samples)
+- **Source**: LibriSpeech (via `hf-internal-testing/librispeech_asr_dummy`, clean/validation, row 0)
+- **ID**: `1272-128104-0000`
+- **Text**: "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL"
+
+### librispeech_1.wav
+
+- **Duration**: 4.8s (77,040 samples)
+- **Source**: LibriSpeech (via `hf-internal-testing/librispeech_asr_dummy`, clean/validation, row 1)
+- **ID**: `1272-128104-0001`
+- **Text**: "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER"
+
+### librispeech_2.wav
+
+- **Duration**: 12.5s (199,760 samples)
+- **Source**: LibriSpeech (via `hf-internal-testing/librispeech_asr_dummy`, clean/validation, row 2)
+- **ID**: `1272-128104-0002`
+- **Text**: "HE TELLS US THAT AT THIS FESTIVE SEASON OF THE YEAR WITH CHRISTMAS AND ROAST BEEF LOOMING BEFORE US SIMILES DRAWN FROM EATING AND ITS RESULTS OCCUR MOST READILY TO THE MIND"
+
+### librispeech_30s.wav
+
+- **Duration**: 29.6s (473,600 samples)
+- **Source**: LibriSpeech test-clean (via `openslr/librispeech_asr`)
+- **ID**: `4970-29093-0006`
+- **Text**: "LAW SEEMED TO HIM WELL ENOUGH AS A SCIENCE BUT HE NEVER COULD DISCOVER A PRACTICAL CASE WHERE IT APPEARED TO HIM WORTH WHILE TO GO TO LAW AND ALL THE CLIENTS WHO STOPPED WITH THIS NEW CLERK IN THE ANTE ROOM OF THE LAW OFFICE WHERE HE WAS WRITING PHILIP INVARIABLY ADVISED TO SETTLE NO MATTER HOW BUT SETTLE GREATLY TO THE DISGUST OF HIS EMPLOYER WHO KNEW THAT JUSTICE BETWEEN MAN AND MAN COULD ONLY BE ATTAINED BY THE RECOGNIZED PROCESSES WITH THE ATTENDANT FEES"
+
+### librispeech_32s.wav
+
+- **Duration**: 31.6s (506,400 samples)
+- **Source**: LibriSpeech test-clean (via `openslr/librispeech_asr`)
+- **ID**: `2094-142345-0008`
+- **Text**: "BUT THERE IS ALWAYS A STRONGER SENSE OF LIFE WHEN THE SUN IS BRILLIANT AFTER RAIN AND NOW HE IS POURING DOWN HIS BEAMS AND MAKING SPARKLES AMONG THE WET STRAW AND LIGHTING UP EVERY PATCH OF VIVID GREEN MOSS ON THE RED TILES OF THE COW SHED AND TURNING EVEN THE MUDDY WATER THAT IS HURRYING ALONG THE CHANNEL TO THE DRAIN INTO A MIRROR FOR THE YELLOW BILLED DUCKS WHO ARE SEIZING THE OPPORTUNITY OF GETTING A DRINK WITH AS MUCH BODY IN IT AS POSSIBLE"
+
+### librispeech_35s.wav
+
+- **Duration**: 35.0s (559,280 samples)
+- **Source**: LibriSpeech test-clean (via `openslr/librispeech_asr`)
+- **ID**: `4507-16021-0047`
+- **Text**: "YESTERDAY YOU WERE TREMBLING FOR A HEALTH THAT IS DEAR TO YOU TO DAY YOU FEAR FOR YOUR OWN TO MORROW IT WILL BE ANXIETY ABOUT MONEY THE DAY AFTER TO MORROW THE DIATRIBE OF A SLANDERER THE DAY AFTER THAT THE MISFORTUNE OF SOME FRIEND THEN THE PREVAILING WEATHER THEN SOMETHING THAT HAS BEEN BROKEN OR LOST THEN A PLEASURE WITH WHICH YOUR CONSCIENCE AND YOUR VERTEBRAL COLUMN REPROACH YOU AGAIN THE COURSE OF PUBLIC AFFAIRS"
+
+## Dataset Citation
+
+LibriSpeech: An ASR corpus based on public domain audio books.
+V. Panayotov, G. Chen, D. Povey, and S. Khudanpur, ICASSP 2015.
+License: CC BY 4.0.

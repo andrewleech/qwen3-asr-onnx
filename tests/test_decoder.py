@@ -3,6 +3,10 @@ Test decoder ONNX export correctness against PyTorch reference.
 
 Tests both decoder_init (prefill) and decoder_step (autoregressive).
 
+The decoder uses stacked KV cache format:
+    present_keys:   [num_layers, batch, kv_heads, seq_len, head_dim]
+    present_values: [num_layers, batch, kv_heads, seq_len, head_dim]
+
 Requires:
     - Qwen3-ASR-0.6B model accessible
     - decoder_init.onnx and decoder_step.onnx in output directory
@@ -25,14 +29,21 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def pytorch_model():
-    from transformers import AutoModel
-
-    model = AutoModel.from_pretrained(
-        "Qwen/Qwen3-ASR-0.6B",
-        torch_dtype=torch.float32,
-        device_map="cpu",
-        trust_remote_code=True,
-    )
+    try:
+        from transformers import AutoModel
+        model = AutoModel.from_pretrained(
+            "Qwen/Qwen3-ASR-0.6B",
+            torch_dtype=torch.float32,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+    except Exception:
+        from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+            Qwen3ASRForConditionalGeneration,
+        )
+        model = Qwen3ASRForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen3-ASR-0.6B", torch_dtype=torch.float32, device_map="cpu",
+        )
     model.eval()
     return model
 
@@ -55,10 +66,9 @@ def step_session():
 
 class TestDecoderInit:
     def test_output_names(self, init_session):
-        """Init session should output logits + KV cache."""
+        """Init session should output logits + stacked keys + stacked values."""
         output_names = [o.name for o in init_session.get_outputs()]
-        assert output_names[0] == "logits"
-        assert len(output_names) == 1 + NUM_LAYERS * 2  # logits + key/value per layer
+        assert output_names == ["logits", "present_keys", "present_values"]
 
     def test_logits_shape(self, init_session):
         """Logits should have shape [batch, seq_len, vocab_size]."""
@@ -66,31 +76,27 @@ class TestDecoderInit:
         embeds = np.random.randn(1, seq_len, 1024).astype(np.float32)
         pos = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
 
-        results = init_session.run(None, {"input_embeds": embeds, "position_ids": pos})
-        logits = results[0]
+        logits, _, _ = init_session.run(
+            ["logits", "present_keys", "present_values"],
+            {"input_embeds": embeds, "position_ids": pos},
+        )
 
-        assert logits.shape[0] == 1
-        assert logits.shape[1] == seq_len
-        assert logits.shape[2] == 151936  # vocab_size
+        assert logits.shape == (1, seq_len, 151936)
 
     def test_kv_cache_shape(self, init_session):
-        """KV cache tensors should have correct shapes."""
+        """Stacked KV cache should have shape [num_layers, batch, kv_heads, seq, head_dim]."""
         seq_len = 50
         embeds = np.random.randn(1, seq_len, 1024).astype(np.float32)
         pos = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
 
-        results = init_session.run(None, {"input_embeds": embeds, "position_ids": pos})
+        _, keys, values = init_session.run(
+            ["logits", "present_keys", "present_values"],
+            {"input_embeds": embeds, "position_ids": pos},
+        )
 
-        # Check each KV pair
-        for i in range(NUM_LAYERS):
-            key = results[1 + i * 2]
-            value = results[2 + i * 2]
-            assert key.shape == (1, NUM_KV_HEADS, seq_len, HEAD_DIM), (
-                f"Layer {i} key shape mismatch: {key.shape}"
-            )
-            assert value.shape == (1, NUM_KV_HEADS, seq_len, HEAD_DIM), (
-                f"Layer {i} value shape mismatch: {value.shape}"
-            )
+        expected = (NUM_LAYERS, 1, NUM_KV_HEADS, seq_len, HEAD_DIM)
+        assert keys.shape == expected, f"Keys shape {keys.shape} != {expected}"
+        assert values.shape == expected, f"Values shape {values.shape} != {expected}"
 
     def test_pytorch_onnx_match(self, pytorch_model, init_session):
         """ONNX logits should match PyTorch within tolerance."""
@@ -99,11 +105,10 @@ class TestDecoderInit:
         pos_np = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
 
         # ONNX
-        onnx_results = init_session.run(None, {
-            "input_embeds": embeds_np,
-            "position_ids": pos_np,
-        })
-        onnx_logits = onnx_results[0]
+        onnx_logits, _, _ = init_session.run(
+            ["logits", "present_keys", "present_values"],
+            {"input_embeds": embeds_np, "position_ids": pos_np},
+        )
 
         # PyTorch
         embeds_pt = torch.from_numpy(embeds_np)
@@ -126,59 +131,43 @@ class TestDecoderInit:
 class TestDecoderStep:
     def test_step_after_init(self, init_session, step_session):
         """Step should work with KV cache from init."""
-        # Run init
         seq_len = 30
         embeds = np.random.randn(1, seq_len, 1024).astype(np.float32)
         pos = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
 
-        init_results = init_session.run(None, {
-            "input_embeds": embeds,
-            "position_ids": pos,
-        })
+        _, present_keys, present_values = init_session.run(
+            ["logits", "present_keys", "present_values"],
+            {"input_embeds": embeds, "position_ids": pos},
+        )
 
-        # Build step inputs from init outputs
+        # Run one step
         step_embeds = np.random.randn(1, 1, 1024).astype(np.float32)
         step_pos = np.array([[seq_len]], dtype=np.int64)
 
-        step_inputs = {
-            "input_embeds": step_embeds,
-            "position_ids": step_pos,
-        }
+        logits, new_keys, new_values = step_session.run(
+            ["logits", "present_keys", "present_values"],
+            {
+                "input_embeds": step_embeds,
+                "position_ids": step_pos,
+                "past_keys": present_keys,
+                "past_values": present_values,
+            },
+        )
 
-        output_names = [o.name for o in init_session.get_outputs()]
-        for i, name in enumerate(output_names[1:], 1):
-            step_name = name.replace("present_", "past_")
-            step_inputs[step_name] = init_results[i]
-
-        # Run step
-        step_results = step_session.run(None, step_inputs)
-
-        logits = step_results[0]
         assert logits.shape == (1, 1, 151936)
-
-        # KV cache should have seq_len + 1
-        for i in range(NUM_LAYERS):
-            key = step_results[1 + i * 2]
-            assert key.shape[2] == seq_len + 1, (
-                f"Layer {i} key seq_len should be {seq_len + 1}, got {key.shape[2]}"
-            )
+        assert new_keys.shape == (NUM_LAYERS, 1, NUM_KV_HEADS, seq_len + 1, HEAD_DIM)
+        assert new_values.shape == (NUM_LAYERS, 1, NUM_KV_HEADS, seq_len + 1, HEAD_DIM)
 
     def test_multi_step(self, init_session, step_session):
         """Multiple decode steps should accumulate KV cache correctly."""
-        # Init
         seq_len = 20
         embeds = np.random.randn(1, seq_len, 1024).astype(np.float32)
         pos = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
 
-        results = init_session.run(None, {
-            "input_embeds": embeds,
-            "position_ids": pos,
-        })
-
-        output_names = [o.name for o in init_session.get_outputs()]
-        kv_cache = {}
-        for i, name in enumerate(output_names[1:], 1):
-            kv_cache[name] = results[i]
+        _, present_keys, present_values = init_session.run(
+            ["logits", "present_keys", "present_values"],
+            {"input_embeds": embeds, "position_ids": pos},
+        )
 
         # Run 5 steps
         current_pos = seq_len
@@ -186,26 +175,17 @@ class TestDecoderStep:
             step_embeds = np.random.randn(1, 1, 1024).astype(np.float32)
             step_pos = np.array([[current_pos]], dtype=np.int64)
 
-            step_inputs = {
-                "input_embeds": step_embeds,
-                "position_ids": step_pos,
-            }
-            for name, value in kv_cache.items():
-                step_name = name.replace("present_", "past_")
-                step_inputs[step_name] = value
-
-            step_results = step_session.run(None, step_inputs)
-
-            # Update KV cache
-            kv_cache = {}
-            step_output_names = [o.name for o in step_session.get_outputs()]
-            for i, name in enumerate(step_output_names[1:], 1):
-                kv_cache[name] = step_results[i]
-
+            _, present_keys, present_values = step_session.run(
+                ["logits", "present_keys", "present_values"],
+                {
+                    "input_embeds": step_embeds,
+                    "position_ids": step_pos,
+                    "past_keys": present_keys,
+                    "past_values": present_values,
+                },
+            )
             current_pos += 1
 
-        # Final KV cache should have seq_len + 5
-        for name, value in kv_cache.items():
-            assert value.shape[2] == seq_len + 5, (
-                f"{name} seq_len should be {seq_len + 5}, got {value.shape[2]}"
-            )
+        expected_seq = seq_len + 5
+        assert present_keys.shape == (NUM_LAYERS, 1, NUM_KV_HEADS, expected_seq, HEAD_DIM)
+        assert present_values.shape == (NUM_LAYERS, 1, NUM_KV_HEADS, expected_seq, HEAD_DIM)

@@ -100,7 +100,7 @@ def copy_tokenizer(model_id: str, output_dir: str):
     tokenizer.save_pretrained(output_dir)
 
     # Remove unwanted files from save_pretrained, keep only tokenizer files
-    keep_files = {"tokenizer.json", "tokenizer_config.json", "config.json"}
+    keep_files = {"tokenizer.json", "tokenizer_config.json"}
     remove_extensions = {".py", ".txt"}
     for f in os.listdir(output_dir):
         if f in keep_files:
