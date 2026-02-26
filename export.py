@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Export Qwen3-ASR-0.6B to ONNX format.
+Export Qwen3-ASR to ONNX format.
 
 Produces:
     encoder.onnx         - Audio encoder (mel -> features)
     decoder_init.onnx    - Decoder prefill (embeddings -> logits + KV cache)
     decoder_step.onnx    - Decoder step (token + KV cache -> logits + KV cache)
-    embed_tokens.bin     - Token embedding matrix [151936, 1024] as raw float32
+    embed_tokens.bin     - Token embedding matrix [vocab_size, hidden_size] as raw float32
     tokenizer.json       - HuggingFace tokenizer
     config.json          - Architecture config + special tokens + mel params
 
 Usage:
-    python export.py --model Qwen/Qwen3-ASR-0.6B --output output/qwen3-asr-0.6b
+    python export.py --model Qwen/Qwen3-ASR-0.6B
+    python export.py --model Qwen/Qwen3-ASR-1.7B
 """
 
 import argparse
@@ -76,7 +77,7 @@ def extract_embed_tokens(model, output_dir: str):
     """
     Save the token embedding matrix as raw float32 bytes.
 
-    Shape: [vocab_size, hidden_size] = [151936, 1024]
+    Shape: [vocab_size, hidden_size] (e.g. [151936, 1024] for 0.6B, [151936, 2048] for 1.7B)
     Format: row-major float32, suitable for memory-mapped loading in Rust.
     """
     embed_weight = model.thinker.model.embed_tokens.weight.data
@@ -214,6 +215,17 @@ def write_config(model, output_dir: str, embed_shape: tuple):
     print(f"Config saved to {output_path}")
 
 
+def _default_output_dir(model_id: str) -> str:
+    """Derive default output directory from model ID.
+
+    "Qwen/Qwen3-ASR-0.6B" -> "output/qwen3-asr-0.6b"
+    "Qwen/Qwen3-ASR-1.7B" -> "output/qwen3-asr-1.7b"
+    "/local/path/model"    -> "output/model"
+    """
+    name = model_id.rstrip("/").rsplit("/", 1)[-1]
+    return os.path.join("output", name.lower())
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export Qwen3-ASR to ONNX")
     parser.add_argument(
@@ -225,8 +237,8 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="output/qwen3-asr-0.6b",
-        help="Output directory for ONNX files",
+        default=None,
+        help="Output directory for ONNX files (default: derived from model name)",
     )
     parser.add_argument(
         "--device",
@@ -251,6 +263,9 @@ def main():
         help="Skip decoder export",
     )
     args = parser.parse_args()
+
+    if args.output is None:
+        args.output = _default_output_dir(args.model)
 
     os.makedirs(args.output, exist_ok=True)
 

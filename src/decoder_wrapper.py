@@ -13,9 +13,9 @@ KV cache is represented as two stacked tensors:
 - past_keys:   [num_layers, batch, kv_heads, seq_len, head_dim]
 - past_values: [num_layers, batch, kv_heads, seq_len, head_dim]
 
-The decoder is Qwen3-0.6B:
-    28 layers, d=1024, 16 Q-heads / 8 KV-heads (GQA 2:1), head_dim=128
+The decoder uses Qwen3 architecture:
     SwiGLU MLP, per-head Q/K RMSNorm, interleaved MRoPE
+    Dimensions vary by model size (0.6B: d=1024, 1.7B: d=2048, etc.)
 """
 
 import torch
@@ -266,13 +266,16 @@ def export_decoder_init(
         opset_version: ONNX opset version.
         device: Device for tracing.
     """
+    text_config = model.config.thinker_config.text_config
+    hidden_size = text_config.hidden_size
+
     text_model = model.thinker.model
     lm_head = model.thinker.lm_head
     wrapper = DecoderInitWrapper(text_model, lm_head).eval().to(device)
 
     # Dummy input: 100 tokens (typical for ~8 seconds of audio + prompt tokens)
     seq_len = 100
-    dummy_embeds = torch.randn(1, seq_len, 1024, device=device, dtype=torch.float32)
+    dummy_embeds = torch.randn(1, seq_len, hidden_size, device=device, dtype=torch.float32)
     dummy_pos = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
 
     input_names = ["input_embeds", "position_ids"]
@@ -316,18 +319,24 @@ def export_decoder_step(
         opset_version: ONNX opset version.
         device: Device for tracing.
     """
+    text_config = model.config.thinker_config.text_config
+    hidden_size = text_config.hidden_size
+    num_layers = text_config.num_hidden_layers
+    num_kv_heads = text_config.num_key_value_heads
+    head_dim = text_config.head_dim
+
     text_model = model.thinker.model
     lm_head = model.thinker.lm_head
     wrapper = DecoderStepWrapper(text_model, lm_head).eval().to(device)
 
     # Dummy inputs: single token + KV cache from 100-token prefill
     past_seq_len = 100
-    dummy_embeds = torch.randn(1, 1, 1024, device=device, dtype=torch.float32)
+    dummy_embeds = torch.randn(1, 1, hidden_size, device=device, dtype=torch.float32)
     dummy_pos = torch.tensor([[past_seq_len]], device=device, dtype=torch.long)
 
     # Stacked KV cache: [num_layers, batch, kv_heads, past_seq, head_dim]
-    dummy_past_keys = torch.randn(NUM_LAYERS, 1, NUM_KV_HEADS, past_seq_len, HEAD_DIM, device=device, dtype=torch.float32)
-    dummy_past_values = torch.randn(NUM_LAYERS, 1, NUM_KV_HEADS, past_seq_len, HEAD_DIM, device=device, dtype=torch.float32)
+    dummy_past_keys = torch.randn(num_layers, 1, num_kv_heads, past_seq_len, head_dim, device=device, dtype=torch.float32)
+    dummy_past_values = torch.randn(num_layers, 1, num_kv_heads, past_seq_len, head_dim, device=device, dtype=torch.float32)
 
     input_names = ["input_embeds", "position_ids", "past_keys", "past_values"]
     output_names = ["logits", "present_keys", "present_values"]

@@ -1,6 +1,6 @@
 # Qwen3-ASR ONNX Export Tool
 
-Export [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) to ONNX format for use with ONNX Runtime.
+Export [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) and [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) to ONNX format for use with ONNX Runtime.
 
 ## Output Files
 
@@ -11,7 +11,7 @@ Each export produces a directory containing:
 | `encoder.onnx` (+`.data`) | Audio encoder (Conv2D stem + transformer + MLP projection) |
 | `decoder_init.onnx` (+`.data`) | Decoder prefill (full sequence, outputs KV cache) |
 | `decoder_step.onnx` (+`.data`) | Decoder autoregressive step (single token + KV cache) |
-| `embed_tokens.bin` | Token embedding matrix [151936, 1024] |
+| `embed_tokens.bin` | Token embedding matrix [vocab_size, hidden_size] |
 | `tokenizer.json` | HuggingFace tokenizer |
 | `config.json` | Architecture config + special tokens + mel params |
 
@@ -20,6 +20,8 @@ The `.onnx.data` files contain the model weights (external data format) and must
 ### FP32 vs INT8
 
 The export tool produces FP32 models. An optional quantization step produces INT8 models.
+
+Sizes below are for 0.6B; 1.7B models are proportionally larger.
 
 |  | FP32 | INT8 |
 |---|---|---|
@@ -47,8 +49,14 @@ pip install -r requirements.txt
 ### Export
 
 ```bash
-python export.py --model Qwen/Qwen3-ASR-0.6B --output output/qwen3-asr-0.6b
+# 0.6B (default)
+python export.py --model Qwen/Qwen3-ASR-0.6B
+
+# 1.7B
+python export.py --model Qwen/Qwen3-ASR-1.7B
 ```
+
+Output directories are derived from the model name (`output/qwen3-asr-0.6b`, `output/qwen3-asr-1.7b`) unless overridden with `--output`.
 
 ### Validate
 
@@ -80,8 +88,8 @@ Runs transcription through 4 paths (native model, PyTorch wrapper, FP32 ONNX, IN
 
 ## Architecture
 
-- **Encoder**: mel `[1, 128, T]` → windowed Conv2D (100-frame windows, 3x stride-2 convs producing 13 tokens per window) → windowed attention (104-token windows across 18 transformer layers, d=896) → MLP(896→1024) → `[1, N, 1024]` where `N = get_feat_extract_output_lengths(T)`
-- **Decoder**: Qwen3-0.6B (28 layers, d=1024, 16 Q-heads / 8 KV-heads, GQA, SwiGLU, MRoPE)
+- **Encoder**: mel `[1, 128, T]` → windowed Conv2D (100-frame windows, 3x stride-2 convs producing 13 tokens per window) → windowed attention (104-token windows across transformer layers) → MLP projection → `[1, N, output_dim]` where `N = get_feat_extract_output_lengths(T)`. 0.6B: 18 layers, d=896, output_dim=1024. 1.7B: 24 layers, d=1024, output_dim=2048.
+- **Decoder**: Qwen3 (28 layers, 16 Q-heads / 8 KV-heads, GQA, SwiGLU, MRoPE). 0.6B: d=1024. 1.7B: d=2048.
 - **Integration**: Prefix LM — encoder output replaces `<|audio_pad|>` token embeddings. Decoder uses self-attention only.
 
 The encoder uses windowed processing from the native Qwen3-ASR architecture: mel frames are split into 100-frame convolution windows, each producing 13 tokens via a 3-layer stride-2 Conv2D stack. Tokens are then grouped into 104-token attention windows for the transformer layers. Padding tokens in the final window are masked out.

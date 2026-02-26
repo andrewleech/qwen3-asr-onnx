@@ -13,7 +13,7 @@ Processing stages:
   5. Flatten, trim to valid_count, project
 
 Input: mel spectrogram [1, 128, time]
-Output: audio features [1, tokens, 1024]
+Output: audio features [1, tokens, output_dim]
 """
 
 import math
@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# 0.6B encoder dimensions
+# 0.6B encoder dimensions (kept for backward compat; EncoderWrapper reads from config)
 NUM_HEADS = 14
 HEAD_DIM = 64
 D_MODEL = 896
@@ -73,7 +73,7 @@ def _encoder_attention(q, k, v, mask, scaling):
     return out.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
 
 
-def _encoder_layer_forward(layer, x, attn_mask, scaling):
+def _encoder_layer_forward(layer, x, attn_mask, scaling, num_heads, head_dim):
     """
     Single encoder layer forward with batched 3D input.
 
@@ -82,6 +82,8 @@ def _encoder_layer_forward(layer, x, attn_mask, scaling):
         x: [batch, seq, d_model]
         attn_mask: [batch, 1, 1, seq] additive mask
         scaling: float
+        num_heads: number of attention heads
+        head_dim: dimension per head
 
     Returns:
         [batch, seq, d_model]
@@ -92,9 +94,9 @@ def _encoder_layer_forward(layer, x, attn_mask, scaling):
     residual = x
     normed = layer.self_attn_layer_norm(x)
 
-    q = sa.q_proj(normed).view(batch, seq, NUM_HEADS, HEAD_DIM).transpose(1, 2)
-    k = sa.k_proj(normed).view(batch, seq, NUM_HEADS, HEAD_DIM).transpose(1, 2)
-    v = sa.v_proj(normed).view(batch, seq, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+    q = sa.q_proj(normed).view(batch, seq, num_heads, head_dim).transpose(1, 2)
+    k = sa.k_proj(normed).view(batch, seq, num_heads, head_dim).transpose(1, 2)
+    v = sa.v_proj(normed).view(batch, seq, num_heads, head_dim).transpose(1, 2)
 
     attn_out = _encoder_attention(q, k, v, attn_mask, scaling)
     attn_out = sa.out_proj(attn_out)
@@ -130,13 +132,19 @@ class EncoderWrapper(nn.Module):
         self.act = audio_tower.act
         self.scaling = self.layers[0].self_attn.scaling
 
+        # Extract dimensions from config (supports 0.6B, 1.7B, etc.)
+        self.d_model = audio_tower.config.d_model
+        self.num_heads = audio_tower.config.encoder_attention_heads
+        self.head_dim = self.d_model // self.num_heads
+        self.output_dim = audio_tower.config.output_dim
+
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
         """
         Args:
             mel: [1, 128, T] log-mel spectrogram.
 
         Returns:
-            [1, valid_count, 1024] audio features.
+            [1, valid_count, output_dim] audio features.
         """
         T = mel.shape[2]
 
@@ -169,15 +177,15 @@ class EncoderWrapper(nn.Module):
 
         # --- Stage 2: Flatten and compute valid_count ---
         valid_count = _get_feat_extract_output_lengths(T)
-        flat = x.reshape(-1, D_MODEL)     # [N * tpw, 896]
-        flat = flat[:valid_count]          # trim conv-padding tokens
+        flat = x.reshape(-1, self.d_model)     # [N * tpw, d_model]
+        flat = flat[:valid_count]               # trim conv-padding tokens
 
         # --- Stage 3: Pad to multiple of ATTN_WINDOW_SIZE, reshape to windows ---
         attn_pad = (ATTN_WINDOW_SIZE - valid_count % ATTN_WINDOW_SIZE) % ATTN_WINDOW_SIZE
         flat = F.pad(flat, (0, 0, 0, attn_pad))  # no-op when attn_pad=0
         total_padded = valid_count + attn_pad
         num_attn_windows = total_padded // ATTN_WINDOW_SIZE
-        x = flat.reshape(num_attn_windows, ATTN_WINDOW_SIZE, D_MODEL)
+        x = flat.reshape(num_attn_windows, ATTN_WINDOW_SIZE, self.d_model)
 
         # --- Stage 4: Attention mask (branch-free) ---
         # Global position for each element; positions >= valid_count are padding
@@ -188,17 +196,17 @@ class EncoderWrapper(nn.Module):
 
         # --- Stage 5: Transformer layers ---
         for layer in self.layers:
-            x = _encoder_layer_forward(layer, x, attn_mask, self.scaling)
+            x = _encoder_layer_forward(layer, x, attn_mask, self.scaling, self.num_heads, self.head_dim)
 
         # --- Stage 6: Flatten, trim, project ---
-        x = x.reshape(-1, D_MODEL)[:valid_count]
-        x = x.unsqueeze(0)  # [1, valid_count, 896]
+        x = x.reshape(-1, self.d_model)[:valid_count]
+        x = x.unsqueeze(0)  # [1, valid_count, d_model]
 
         x = self.ln_post(x)
         x = self.act(self.proj1(x))
         x = self.proj2(x)
 
-        return x  # [1, valid_count, 1024]
+        return x  # [1, valid_count, output_dim]
 
 
 def export_encoder(
@@ -209,6 +217,7 @@ def export_encoder(
 ):
     """Export the audio encoder to ONNX."""
     audio_tower = model.thinker.audio_tower
+    output_dim = audio_tower.config.output_dim
     wrapper = EncoderWrapper(audio_tower).eval().to(device)
 
     # Use non-round frame count to exercise padding code during tracing
@@ -217,8 +226,8 @@ def export_encoder(
     with torch.no_grad():
         test_output = wrapper(dummy_mel)
         expected_tokens = _get_feat_extract_output_lengths(997)
-        assert test_output.shape == (1, expected_tokens, 1024), (
-            f"Shape {test_output.shape} != expected (1, {expected_tokens}, 1024)"
+        assert test_output.shape == (1, expected_tokens, output_dim), (
+            f"Shape {test_output.shape} != expected (1, {expected_tokens}, {output_dim})"
         )
 
     with torch.no_grad():
