@@ -54,6 +54,11 @@ python export.py --model Qwen/Qwen3-ASR-0.6B
 
 # 1.7B
 python export.py --model Qwen/Qwen3-ASR-1.7B
+
+# Additional options
+python export.py --model Qwen/Qwen3-ASR-0.6B --output /path/to/dir --device cuda --opset 18
+python export.py --model Qwen/Qwen3-ASR-0.6B --skip-encoder   # re-export decoders only
+python export.py --model Qwen/Qwen3-ASR-0.6B --skip-decoder   # re-export encoder only
 ```
 
 Output directories are derived from the model name (`output/qwen3-asr-0.6b`, `output/qwen3-asr-1.7b`) unless overridden with `--output`.
@@ -112,6 +117,10 @@ Tested against the native Qwen3-ASR model on LibriSpeech samples (5s to 35s).
 - **Native vs FP32**: Identical on short audio. On long audio (>30s), SDPA vs eager attention causes punctuation-level divergence; word content matches.
 - **INT8**: Exact on short audio. Degrades on long audio due to quantization error accumulation.
 
+## DirectML Compatibility
+
+The exported ONNX graphs are patched post-export to remove `allowzero=1` from all `Reshape` nodes. DirectML rejects this attribute, and no shape tensor in the graphs contains a literal zero dimension, so removal is safe. This is done automatically during export.
+
 ## Tests
 
 ```bash
@@ -119,3 +128,7 @@ python -m pytest tests/
 ```
 
 Audio fixtures in `tests/fixtures/` are tracked with Git LFS. Run `git lfs pull` after cloning to fetch them. See `tests/fixtures/README.md` for provenance.
+
+## License
+
+Apache 2.0, matching the upstream Qwen3-ASR models.

@@ -15,7 +15,7 @@ from huggingface_hub import HfApi
 MODEL_CARD_TEMPLATE = """\
 ---
 license: apache-2.0
-base_model: Qwen/Qwen3-ASR-0.6B
+base_model: {base_model}
 tags:
   - onnx
   - asr
@@ -26,18 +26,18 @@ language:
 library_name: onnxruntime
 ---
 
-# Qwen3-ASR-0.6B ONNX
+# {model_name} ONNX
 
-ONNX export of [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) for use with ONNX Runtime.
+ONNX export of [{base_model}](https://huggingface.co/{base_model}) for use with ONNX Runtime.
 
 ## Files
 
 | File | Description |
 |---|---|
-| `encoder.onnx` | Audio encoder: mel [1, 128, T] -> features [1, T/8, 1024] |
+| `encoder.onnx` | Audio encoder: mel [1, 128, T] -> features [1, T/8, {output_dim}] |
 | `decoder_init.onnx` | Decoder prefill: embeddings -> logits + KV cache |
 | `decoder_step.onnx` | Decoder step: token + KV cache -> logits + KV cache |
-| `embed_tokens.bin` | Token embedding matrix [151936, 1024], {embed_dtype} |
+| `embed_tokens.bin` | Token embedding matrix [{vocab_size}, {hidden_size}], {embed_dtype} |
 | `tokenizer.json` | HuggingFace tokenizer |
 | `config.json` | Architecture config |
 
@@ -81,6 +81,7 @@ def main():
     parser = argparse.ArgumentParser(description="Upload ONNX model to HuggingFace Hub")
     parser.add_argument("--input", required=True, help="Directory with ONNX files")
     parser.add_argument("--repo", required=True, help="HuggingFace repo ID (e.g. user/model-onnx)")
+    parser.add_argument("--model", default=None, help="Base model ID (e.g. Qwen/Qwen3-ASR-0.6B) for model card")
     parser.add_argument("--private", action="store_true", help="Create private repo")
     args = parser.parse_args()
 
@@ -90,15 +91,29 @@ def main():
     print(f"Creating repo {args.repo}...")
     api.create_repo(args.repo, exist_ok=True, private=args.private)
 
-    # Determine embed dtype for model card
+    # Read config for model card fields
     import json
     config_path = os.path.join(args.input, "config.json")
     with open(config_path) as f:
         config = json.load(f)
+
     embed_dtype = config.get("embed_tokens_dtype", "float32")
+    vocab_size, hidden_size = config["embed_tokens_shape"]
+    output_dim = config["encoder"]["output_dim"]
+
+    # Derive base_model from --model arg or fall back to repo name
+    base_model = args.model or f"Qwen/{args.repo.rsplit('/', 1)[-1].replace('-onnx', '').upper()}"
+    model_name = base_model.rsplit("/", 1)[-1]
 
     # Write model card
-    readme_content = MODEL_CARD_TEMPLATE.format(embed_dtype=embed_dtype)
+    readme_content = MODEL_CARD_TEMPLATE.format(
+        base_model=base_model,
+        model_name=model_name,
+        embed_dtype=embed_dtype,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        output_dim=output_dim,
+    )
     readme_path = os.path.join(args.input, "README.md")
     with open(readme_path, "w") as f:
         f.write(readme_content)
@@ -108,7 +123,7 @@ def main():
     api.upload_folder(
         folder_path=args.input,
         repo_id=args.repo,
-        commit_message="Upload Qwen3-ASR-0.6B ONNX export",
+        commit_message=f"Upload {model_name} ONNX export",
     )
 
     print(f"Upload complete: https://huggingface.co/{args.repo}")
