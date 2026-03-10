@@ -25,7 +25,7 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from src.encoder_wrapper import export_encoder
-from src.decoder_wrapper import export_decoder_init, export_decoder_step
+from src.decoder_wrapper import export_decoder, export_decoder_init, export_decoder_step
 from src.prompt import (
     ENDOFTEXT_TOKEN_ID,
     IM_START_TOKEN_ID,
@@ -262,6 +262,12 @@ def main():
         action="store_true",
         help="Skip decoder export",
     )
+    parser.add_argument(
+        "--split-decoder",
+        action="store_true",
+        help="Export separate decoder_init + decoder_step instead of unified decoder.onnx "
+             "(legacy format; doubles decoder weight storage)",
+    )
     args = parser.parse_args()
 
     if args.output is None:
@@ -288,21 +294,29 @@ def main():
 
     # Export decoder
     if not args.skip_decoder:
-        print("\n=== Exporting decoder (init) ===")
-        export_decoder_init(
-            model,
-            os.path.join(args.output, "decoder_init.onnx"),
-            opset_version=args.opset,
-            device=args.device,
-        )
-
-        print("\n=== Exporting decoder (step) ===")
-        export_decoder_step(
-            model,
-            os.path.join(args.output, "decoder_step.onnx"),
-            opset_version=args.opset,
-            device=args.device,
-        )
+        if args.split_decoder:
+            print("\n=== Exporting decoder (init) — legacy split format ===")
+            export_decoder_init(
+                model,
+                os.path.join(args.output, "decoder_init.onnx"),
+                opset_version=args.opset,
+                device=args.device,
+            )
+            print("\n=== Exporting decoder (step) — legacy split format ===")
+            export_decoder_step(
+                model,
+                os.path.join(args.output, "decoder_step.onnx"),
+                opset_version=args.opset,
+                device=args.device,
+            )
+        else:
+            print("\n=== Exporting unified decoder ===")
+            export_decoder(
+                model,
+                os.path.join(args.output, "decoder.onnx"),
+                opset_version=args.opset,
+                device=args.device,
+            )
 
     # Extract embedding matrix
     print("\n=== Extracting embedding matrix ===")

@@ -133,15 +133,28 @@ def load_onnx_sessions(onnx_dir: str) -> dict:
     if "CUDAExecutionProvider" in ort.get_available_providers():
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
-    for name in ["encoder", "decoder_init", "decoder_step"]:
+    # Support both unified decoder (decoder.onnx) and legacy split (decoder_init + decoder_step)
+    for name in ["encoder"]:
         path = os.path.join(onnx_dir, f"{name}.onnx")
         if os.path.exists(path):
             sessions[name] = ort.InferenceSession(path, providers=providers)
+    unified_path = os.path.join(onnx_dir, "decoder.onnx")
+    if os.path.exists(unified_path):
+        sessions["decoder"] = ort.InferenceSession(unified_path, providers=providers)
+    else:
+        for name in ["decoder_init", "decoder_step"]:
+            path = os.path.join(onnx_dir, f"{name}.onnx")
+            if os.path.exists(path):
+                sessions[name] = ort.InferenceSession(path, providers=providers)
     return sessions
 
 
+def _is_unified(sessions: dict) -> bool:
+    return "decoder" in sessions
+
+
 def run_onnx(sessions, embed_tokens, audio: np.ndarray, tokenizer, label: str) -> dict:
-    """Run full ONNX pipeline."""
+    """Run full ONNX pipeline. Supports unified decoder (decoder.onnx) and legacy split."""
     from src.mel import log_mel_spectrogram
     from src.prompt import build_prompt_ids, get_audio_pad_range, EOS_TOKEN_IDS
 
@@ -165,25 +178,47 @@ def run_onnx(sessions, embed_tokens, audio: np.ndarray, tokenizer, label: str) -
     input_embeds = input_embeds[np.newaxis, :, :]
     position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
 
-    # Prefill
     t0 = time.time()
-    logits, present_keys, present_values = sessions["decoder_init"].run(
-        ["logits", "present_keys", "present_values"],
-        {"input_embeds": input_embeds, "position_ids": position_ids},
-    )
+    unified = _is_unified(sessions)
+
+    if unified:
+        # Unified decoder: prefill with past_seq=0
+        nl = present_keys_shape = None  # inferred from output
+        num_layers = 28  # model-specific; could load from config
+        num_kv_heads = 8
+        head_dim = 128
+        hidden_size = embed_tokens.shape[1]
+        past_keys = np.zeros((num_layers, 1, num_kv_heads, 0, head_dim), dtype=np.float32)
+        past_values = np.zeros((num_layers, 1, num_kv_heads, 0, head_dim), dtype=np.float32)
+
+        logits, present_keys, present_values = sessions["decoder"].run(
+            ["logits", "present_keys", "present_values"],
+            {
+                "input_embeds": input_embeds,
+                "position_ids": position_ids,
+                "past_keys": past_keys,
+                "past_values": past_values,
+            },
+        )
+    else:
+        logits, present_keys, present_values = sessions["decoder_init"].run(
+            ["logits", "present_keys", "present_values"],
+            {"input_embeds": input_embeds, "position_ids": position_ids},
+        )
 
     next_token = int(np.argmax(logits[0, -1, :]))
     tokens = [next_token]
 
     # Autoregressive decode
     pos = len(prompt_ids)
+    decoder_key = "decoder" if unified else "decoder_step"
     for _ in range(255):
         if next_token in EOS_TOKEN_IDS:
             break
         token_embed = embed_tokens[next_token][np.newaxis, np.newaxis, :]
         step_pos = np.array([[pos]], dtype=np.int64)
 
-        logits, present_keys, present_values = sessions["decoder_step"].run(
+        logits, present_keys, present_values = sessions[decoder_key].run(
             ["logits", "present_keys", "present_values"],
             {
                 "input_embeds": token_embed,

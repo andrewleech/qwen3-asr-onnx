@@ -99,7 +99,10 @@ def _decoder_layer_forward(layer, hidden_states, cos, sin, mask, past_key, past_
     # Apply RoPE
     query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    # Concatenate with past KV if provided (step mode)
+    # Concatenate with past KV.
+    # For the unified decoder: past_key/past_value always provided; past_seq may be 0.
+    # torch.cat with a zero-length tensor is a no-op and traces cleanly.
+    # For the legacy init/step wrappers: past_key is None for init, provided for step.
     if past_key is not None:
         key_states = torch.cat([past_key, key_states], dim=2)
         value_states = torch.cat([past_value, value_states], dim=2)
@@ -249,6 +252,157 @@ class DecoderStepWrapper(nn.Module):
         present_keys = torch.stack(all_keys, dim=0)
         present_values = torch.stack(all_values, dim=0)
         return logits, present_keys, present_values
+
+
+class DecoderWrapper(nn.Module):
+    """
+    Unified decoder: handles both prefill and autoregressive decode in one ONNX graph.
+
+    Eliminates the init/step split and the associated weight duplication (~2.3 GB saved).
+
+    Interface:
+        Inputs:
+            input_embeds: [batch, q_len, hidden_size]   q_len=full_seq for prefill, 1 for step
+            position_ids: [batch, q_len]
+            past_keys:    [num_layers, batch, kv_heads, past_seq, head_dim]   past_seq=0 for prefill
+            past_values:  [num_layers, batch, kv_heads, past_seq, head_dim]   past_seq=0 for prefill
+        Outputs:
+            logits:         [batch, q_len, vocab_size]
+            present_keys:   [num_layers, batch, kv_heads, past_seq + q_len, head_dim]
+            present_values: [num_layers, batch, kv_heads, past_seq + q_len, head_dim]
+
+    Attention mask is derived internally from tensor shapes:
+    - past positions (past_seq columns): always visible (mask = 0)
+    - current positions (q_len columns): upper-triangular causal mask
+    This correctly handles prefill (past_seq=0, q_len=N) and decode step (past_seq=P, q_len=1).
+    """
+
+    def __init__(self, text_model, lm_head):
+        super().__init__()
+        self.layers = text_model.layers
+        self.norm = text_model.norm
+        self.rotary_emb = text_model.rotary_emb
+        self.lm_head = lm_head
+
+    def forward(
+        self,
+        input_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_keys: torch.Tensor,
+        past_values: torch.Tensor,
+    ):
+        batch, q_len = input_embeds.shape[:2]
+        past_seq = past_keys.shape[3]
+
+        # MRoPE: tile position_ids to 3D for the rotary embedding call
+        pos_3d = position_ids.unsqueeze(0).expand(3, -1, -1)
+        cos, sin = self.rotary_emb(input_embeds, pos_3d)
+
+        # Build attention mask from tensor shapes (fully traceable):
+        # [q_len, past_seq] of zeros  ||  [q_len, q_len] causal block
+        causal_block = torch.triu(
+            torch.full(
+                (q_len, q_len),
+                torch.finfo(input_embeds.dtype).min,
+                dtype=input_embeds.dtype,
+                device=input_embeds.device,
+            ),
+            diagonal=1,
+        )
+        past_padding = torch.zeros(
+            q_len, past_seq, dtype=input_embeds.dtype, device=input_embeds.device
+        )
+        # [1, 1, q_len, past_seq + q_len]
+        mask = torch.cat([past_padding, causal_block], dim=1).unsqueeze(0).unsqueeze(0)
+
+        hidden_states = input_embeds
+        all_keys = []
+        all_values = []
+
+        for i, layer in enumerate(self.layers):
+            hidden_states, key_states, value_states = _decoder_layer_forward(
+                layer, hidden_states, cos, sin, mask,
+                past_key=past_keys[i], past_value=past_values[i],
+            )
+            all_keys.append(key_states)
+            all_values.append(value_states)
+
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+
+        present_keys = torch.stack(all_keys, dim=0)
+        present_values = torch.stack(all_values, dim=0)
+        return logits, present_keys, present_values
+
+
+def export_decoder(
+    model,
+    output_path: str,
+    opset_version: int = 17,
+    device: str = "cpu",
+):
+    """
+    Export the unified decoder (prefill + decode step) graph to ONNX.
+
+    Replaces the separate decoder_init / decoder_step exports.
+    Caller passes past_keys/past_values with past_seq=0 for the first (prefill) call,
+    and with the returned present_keys/present_values for subsequent decode steps.
+
+    Args:
+        model: Loaded Qwen3ASRForConditionalGeneration model.
+        output_path: Path to save the .onnx file.
+        opset_version: ONNX opset version.
+        device: Device for tracing.
+    """
+    text_config = model.config.thinker_config.text_config
+    hidden_size = text_config.hidden_size
+    num_layers = text_config.num_hidden_layers
+    num_kv_heads = text_config.num_key_value_heads
+    head_dim = text_config.head_dim
+
+    text_model = model.thinker.model
+    lm_head = model.thinker.lm_head
+    wrapper = DecoderWrapper(text_model, lm_head).eval().to(device)
+
+    # Trace with a non-trivial prefill sequence (past_seq=0, q_len=100).
+    # The zero-length past tensor must be explicitly created with the right shape.
+    q_len = 100
+    dummy_embeds = torch.randn(1, q_len, hidden_size, device=device, dtype=torch.float32)
+    dummy_pos = torch.arange(q_len, device=device, dtype=torch.long).unsqueeze(0)
+    # past_seq=0: zero-length in the sequence dimension
+    dummy_past_keys = torch.zeros(num_layers, 1, num_kv_heads, 0, head_dim, device=device, dtype=torch.float32)
+    dummy_past_values = torch.zeros(num_layers, 1, num_kv_heads, 0, head_dim, device=device, dtype=torch.float32)
+
+    input_names = ["input_embeds", "position_ids", "past_keys", "past_values"]
+    output_names = ["logits", "present_keys", "present_values"]
+
+    dynamic_axes = {
+        "input_embeds": {0: "batch", 1: "q_len"},
+        "position_ids": {0: "batch", 1: "q_len"},
+        "past_keys": {1: "batch", 3: "past_seq"},
+        "past_values": {1: "batch", 3: "past_seq"},
+        "logits": {0: "batch", 1: "q_len"},
+        "present_keys": {1: "batch", 3: "total_seq"},
+        "present_values": {1: "batch", 3: "total_seq"},
+    }
+
+    args = (dummy_embeds, dummy_pos, dummy_past_keys, dummy_past_values)
+
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            args,
+            output_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=opset_version,
+            do_constant_folding=True,
+        )
+
+    from .onnx_fixup import fix_reshape_allowzero
+    n = fix_reshape_allowzero(output_path)
+    print(f"Unified decoder exported to {output_path} (fixed {n} Reshape allowzero attrs)")
 
 
 def export_decoder_init(

@@ -20,7 +20,11 @@ import onnx
 from onnxruntime.quantization import quantize_dynamic, QuantType
 
 
-ONNX_FILES = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"]
+# Unified decoder format uses decoder.onnx; legacy split format uses decoder_init + decoder_step.
+# encoder.onnx is always present.
+ONNX_FILES_BASE = ["encoder.onnx"]
+ONNX_FILES_UNIFIED = ["decoder.onnx"]
+ONNX_FILES_SPLIT = ["decoder_init.onnx", "decoder_step.onnx"]
 
 
 def _total_size(path: str) -> int:
@@ -118,9 +122,14 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
+    # Detect unified vs split decoder format
+    unified_path = os.path.join(args.input, "decoder.onnx")
+    decoder_files = ONNX_FILES_UNIFIED if os.path.exists(unified_path) else ONNX_FILES_SPLIT
+    onnx_files = ONNX_FILES_BASE + decoder_files
+
     # Quantize ONNX files
     print("Quantizing ONNX files...")
-    for filename in ONNX_FILES:
+    for filename in onnx_files:
         input_path = os.path.join(args.input, filename)
         if not os.path.exists(input_path):
             print(f"  Skipping {filename} (not found)")
