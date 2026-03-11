@@ -1,0 +1,50 @@
+[
+  {
+    "dataset": "LibriSpeech test-other",
+    "model": "0.6B FP32",
+    "n": 200,
+    "wer": 4.4243
+  },
+  {
+    "dataset": "LibriSpeech test-other",
+    "model": "0.6B INT8",
+    "n": 200,
+    "wer": 6.7465
+  },
+  {
+    "dataset": "LibriSpeech test-other",
+    "model": "1.7B FP32",
+    "n": 200,
+    "wer": 3.7888
+  },
+  {
+    "dataset": "LibriSpeech test-other",
+    "model": "1.7B INT8",
+    "n": 200,
+    "wer": 11.7331
+  },
+  {
+    "dataset": "AMI SDM test",
+    "model": "0.6B FP32",
+    "n": 200,
+    "wer": 48.4762
+  },
+  {
+    "dataset": "AMI SDM test",
+    "model": "0.6B INT8",
+    "n": 200,
+    "wer": 52.8571
+  },
+  {
+    "dataset": "AMI SDM test",
+    "model": "1.7B FP32",
+    "n": 200,
+    "wer": 45.0476
+  },
+  {
+    "dataset": "AMI SDM test",
+    "model": "1.7B INT8",
+    "n": 200,
+    "wer": 70.381
+  }
+]
