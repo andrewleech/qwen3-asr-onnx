@@ -45,7 +45,7 @@ engine auto-detects INT8 models when present.
 
 | File | Description |
 |---|---|
-| `encoder.onnx` + `.data` | Audio encoder (mel → features) |
+| `encoder.onnx` | Audio encoder (mel → features) |
 | `decoder_init.onnx` | Decoder prefill (embeddings → logits + KV cache) |
 | `decoder_step.onnx` | Decoder step (token + KV cache → logits + KV cache) |
 | `decoder_weights.data` | Shared external weights for both decoder models |
@@ -54,7 +54,7 @@ engine auto-detects INT8 models when present.
 
 | File | Description |
 |---|---|
-| `encoder.int8.onnx` + `.data` | INT8 quantized audio encoder |
+| `encoder.int8.onnx` | INT8 quantized audio encoder |
 | `decoder_init.int8.onnx` | INT8 decoder prefill |
 | `decoder_step.int8.onnx` | INT8 decoder step |
 | `decoder_weights.int8.data` | Shared external weights for INT8 decoders |

@@ -31,7 +31,6 @@ INT8_RENAME = {
 
 # External data file renames
 INT8_DATA_RENAME = {
-    "encoder.onnx.data": "encoder.int8.onnx.data",
     "decoder_weights.data": "decoder_weights.int8.data",
 }
 
@@ -127,7 +126,6 @@ def package(fp32_dir, int8_dir, output_dir, create_tar):
     print(f"\nCopying FP32 files from {fp32_dir}:")
     fp32_files = [
         "encoder.onnx",
-        "encoder.onnx.data",
         "decoder_init.onnx",
         "decoder_step.onnx",
         "decoder_weights.data",
@@ -209,7 +207,7 @@ def package(fp32_dir, int8_dir, output_dir, create_tar):
             is_fp32_onnx = (
                 name.endswith(".onnx") and ".int8." not in name
             )
-            is_fp32_data = name in ("encoder.onnx.data", "decoder_weights.data")
+            is_fp32_data = name == "decoder_weights.data"
             if is_fp32_onnx or is_fp32_data:
                 continue
             int8_tar_files.add(name)
