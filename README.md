@@ -139,6 +139,102 @@ python compare.py --audio tests/fixtures/librispeech_0.wav
 python upload.py --input output/qwen3-asr-0.6b --repo andrewleech/qwen3-asr-0.6b-onnx
 ```
 
+## Full Reproduction
+
+Complete sequence to produce all output variants from the upstream HuggingFace models. All commands assume `uv run python` (or activate the venv and use `python` directly).
+
+The upstream models are downloaded automatically from HuggingFace on first use and cached in `~/.cache/huggingface/hub/`.
+
+### 0.6B
+
+```bash
+# FP32 export (~5 min, ~4 GB RAM)
+uv run python export.py --model Qwen/Qwen3-ASR-0.6B
+
+# Validate FP32 ONNX matches PyTorch
+uv run python validate.py \
+    --onnx-dir output/qwen3-asr-0.6b \
+    --audio tests/fixtures/test_audio.wav
+
+# Naive INT8 quantization (~2 min)
+uv run python quantize.py \
+    --input output/qwen3-asr-0.6b \
+    --output output/qwen3-asr-0.6b-int8
+
+# AWQ smooth + re-export (~25 min, ~6 GB RAM — calibration is the bottleneck)
+uv run python awq_smooth.py \
+    --model Qwen/Qwen3-ASR-0.6B \
+    --output output/qwen3-asr-0.6b-smooth \
+    --alpha 0.5 --n-samples 128 --verify
+
+# Quantize smoothed model
+uv run python quantize.py \
+    --input output/qwen3-asr-0.6b-smooth \
+    --output output/qwen3-asr-0.6b-smooth-int8
+```
+
+### 1.7B
+
+```bash
+# FP32 export (~15 min, ~10 GB RAM)
+uv run python export.py --model Qwen/Qwen3-ASR-1.7B
+
+# Validate
+uv run python validate.py \
+    --onnx-dir output/qwen3-asr-1.7b \
+    --audio tests/fixtures/test_audio.wav
+
+# Naive INT8
+uv run python quantize.py \
+    --input output/qwen3-asr-1.7b \
+    --output output/qwen3-asr-1.7b-int8
+
+# AWQ smooth (~60 min calibration, ~12 GB RAM peak)
+# Note: do NOT use --verify for 1.7B — loading two model copies
+# plus ONNX export buffers can exceed 32 GB and trigger OOM.
+uv run python awq_smooth.py \
+    --model Qwen/Qwen3-ASR-1.7B \
+    --output output/qwen3-asr-1.7b-smooth \
+    --alpha 0.5 --n-samples 128
+
+# Quantize smoothed model
+uv run python quantize.py \
+    --input output/qwen3-asr-1.7b-smooth \
+    --output output/qwen3-asr-1.7b-smooth-int8
+```
+
+### WER evaluation (all variants)
+
+```bash
+uv run python evaluate_wer.py \
+    --models "0.6B FP32:output/qwen3-asr-0.6b" \
+             "0.6B INT8:output/qwen3-asr-0.6b-int8" \
+             "0.6B smooth INT8:output/qwen3-asr-0.6b-smooth-int8" \
+             "1.7B FP32:output/qwen3-asr-1.7b" \
+             "1.7B INT8:output/qwen3-asr-1.7b-int8" \
+             "1.7B smooth INT8:output/qwen3-asr-1.7b-smooth-int8" \
+    --datasets librispeech-other \
+    --n-samples 200 --output wer_results.json
+```
+
+### Output directories
+
+After full reproduction:
+
+```
+output/
+├── qwen3-asr-0.6b/              # FP32
+├── qwen3-asr-0.6b-int8/         # Naive INT8
+├── qwen3-asr-0.6b-smooth/       # AWQ-smoothed FP32 (+ calibration_activations.npz)
+├── qwen3-asr-0.6b-smooth-int8/  # AWQ-smoothed INT8
+├── qwen3-asr-1.7b/
+├── qwen3-asr-1.7b-int8/
+├── qwen3-asr-1.7b-smooth/
+└── qwen3-asr-1.7b-smooth-int8/
+```
+
+Each directory is self-contained and can be used directly by ONNX Runtime consumers (e.g. [transcribe-rs](https://github.com/andrewleech/transcribe-rs)).
+
 ## Architecture
 
 - **Encoder**: mel `[1, 128, T]` → windowed Conv2D (100-frame windows, 3x stride-2 convs producing 13 tokens per window) → windowed attention (104-token windows across transformer layers) → MLP projection → `[1, N, output_dim]` where `N = get_feat_extract_output_lengths(T)`. 0.6B: 18 layers, d=896, output_dim=1024. 1.7B: 24 layers, d=1024, output_dim=2048.
