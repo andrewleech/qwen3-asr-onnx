@@ -14,3 +14,5 @@ venv/
 env/
 .env
 research_notes.md
+release/
+optimize.log

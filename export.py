@@ -26,6 +26,7 @@ from transformers import AutoModel, AutoTokenizer
 
 from src.encoder_wrapper import export_encoder
 from src.decoder_wrapper import export_decoder, export_decoder_init, export_decoder_step
+from share_weights import share_external_models
 from src.prompt import (
     ENDOFTEXT_TOKEN_ID,
     IM_START_TOKEN_ID,
@@ -265,8 +266,12 @@ def main():
     parser.add_argument(
         "--split-decoder",
         action="store_true",
-        help="Export separate decoder_init + decoder_step instead of unified decoder.onnx "
-             "(legacy format; doubles decoder weight storage)",
+        help="Export separate decoder_init + decoder_step instead of unified decoder.onnx",
+    )
+    parser.add_argument(
+        "--no-share-weights",
+        action="store_true",
+        help="Skip weight sharing for split decoder (keep separate .data files)",
     )
     args = parser.parse_args()
 
@@ -295,20 +300,23 @@ def main():
     # Export decoder
     if not args.skip_decoder:
         if args.split_decoder:
-            print("\n=== Exporting decoder (init) — legacy split format ===")
+            print("\n=== Exporting decoder (init) ===")
             export_decoder_init(
                 model,
                 os.path.join(args.output, "decoder_init.onnx"),
                 opset_version=args.opset,
                 device=args.device,
             )
-            print("\n=== Exporting decoder (step) — legacy split format ===")
+            print("\n=== Exporting decoder (step) ===")
             export_decoder_step(
                 model,
                 os.path.join(args.output, "decoder_step.onnx"),
                 opset_version=args.opset,
                 device=args.device,
             )
+            if not args.no_share_weights:
+                print("\n=== Sharing decoder weights ===")
+                share_external_models(args.output)
         else:
             print("\n=== Exporting unified decoder ===")
             export_decoder(

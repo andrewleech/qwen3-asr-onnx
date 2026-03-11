@@ -19,6 +19,8 @@ import numpy as np
 import onnx
 from onnxruntime.quantization import quantize_dynamic, QuantType
 
+from share_weights import share_external_models
+
 
 # Unified decoder format uses decoder.onnx; legacy split format uses decoder_init + decoder_step.
 # encoder.onnx is always present.
@@ -118,6 +120,11 @@ def main():
     parser = argparse.ArgumentParser(description="Quantize ONNX models to INT8")
     parser.add_argument("--input", required=True, help="Input directory with FP32 ONNX files")
     parser.add_argument("--output", required=True, help="Output directory for INT8 files")
+    parser.add_argument(
+        "--no-share-weights",
+        action="store_true",
+        help="Skip weight sharing for split decoder after quantization",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -137,6 +144,11 @@ def main():
 
         output_path = os.path.join(args.output, filename)
         quantize_onnx_file(input_path, output_path)
+
+    # Share weights for split decoder format
+    if decoder_files == ONNX_FILES_SPLIT and not args.no_share_weights:
+        print("\nSharing quantized decoder weights...")
+        share_external_models(args.output)
 
     # Quantize embeddings
     print("\nQuantizing embeddings...")
