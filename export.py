@@ -3,9 +3,10 @@
 Export Qwen3-ASR to ONNX format.
 
 Produces:
-    encoder.onnx         - Audio encoder (mel -> features)
+    encoder.onnx         - Audio encoder (mel -> features), weights embedded in proto
     decoder_init.onnx    - Decoder prefill (embeddings -> logits + KV cache)
     decoder_step.onnx    - Decoder step (token + KV cache -> logits + KV cache)
+    decoder_weights.data - Shared external weights for both decoder models
     embed_tokens.bin     - Token embedding matrix [vocab_size, hidden_size] as raw float32
     tokenizer.json       - HuggingFace tokenizer
     config.json          - Architecture config + special tokens + mel params
@@ -25,7 +26,9 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from src.encoder_wrapper import export_encoder
-from src.decoder_wrapper import export_decoder, export_decoder_init, export_decoder_step
+import onnx
+
+from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from share_weights import share_external_models
 from src.prompt import (
     ENDOFTEXT_TOKEN_ID,
@@ -264,14 +267,9 @@ def main():
         help="Skip decoder export",
     )
     parser.add_argument(
-        "--split-decoder",
-        action="store_true",
-        help="Export separate decoder_init + decoder_step instead of unified decoder.onnx",
-    )
-    parser.add_argument(
         "--no-share-weights",
         action="store_true",
-        help="Skip weight sharing for split decoder (keep separate .data files)",
+        help="Skip weight sharing (keep separate .data files for each decoder model)",
     )
     args = parser.parse_args()
 
@@ -290,41 +288,41 @@ def main():
     # Export encoder
     if not args.skip_encoder:
         print("\n=== Exporting encoder ===")
+        encoder_path = os.path.join(args.output, "encoder.onnx")
         export_encoder(
             model,
-            os.path.join(args.output, "encoder.onnx"),
+            encoder_path,
             opset_version=args.opset,
             device=args.device,
         )
+        # Embed encoder weights into the .onnx proto (eliminates encoder.onnx.data).
+        # Safe for all model sizes: 0.6B=751MB, 1.7B=1.28GB — well under protobuf 2GB limit.
+        encoder_data = encoder_path + ".data"
+        if os.path.exists(encoder_data):
+            print("  Embedding encoder weights into .onnx proto...")
+            enc = onnx.load(encoder_path, load_external_data=True)
+            onnx.save(enc, encoder_path)
+            os.remove(encoder_data)
 
-    # Export decoder
+    # Export decoder (split architecture: decoder_init + decoder_step)
     if not args.skip_decoder:
-        if args.split_decoder:
-            print("\n=== Exporting decoder (init) ===")
-            export_decoder_init(
-                model,
-                os.path.join(args.output, "decoder_init.onnx"),
-                opset_version=args.opset,
-                device=args.device,
-            )
-            print("\n=== Exporting decoder (step) ===")
-            export_decoder_step(
-                model,
-                os.path.join(args.output, "decoder_step.onnx"),
-                opset_version=args.opset,
-                device=args.device,
-            )
-            if not args.no_share_weights:
-                print("\n=== Sharing decoder weights ===")
-                share_external_models(args.output)
-        else:
-            print("\n=== Exporting unified decoder ===")
-            export_decoder(
-                model,
-                os.path.join(args.output, "decoder.onnx"),
-                opset_version=args.opset,
-                device=args.device,
-            )
+        print("\n=== Exporting decoder (init) ===")
+        export_decoder_init(
+            model,
+            os.path.join(args.output, "decoder_init.onnx"),
+            opset_version=args.opset,
+            device=args.device,
+        )
+        print("\n=== Exporting decoder (step) ===")
+        export_decoder_step(
+            model,
+            os.path.join(args.output, "decoder_step.onnx"),
+            opset_version=args.opset,
+            device=args.device,
+        )
+        if not args.no_share_weights:
+            print("\n=== Sharing decoder weights ===")
+            share_external_models(args.output)
 
     # Extract embedding matrix
     print("\n=== Extracting embedding matrix ===")

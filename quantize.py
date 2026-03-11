@@ -3,7 +3,7 @@
 INT8 dynamic quantization for Qwen3-ASR ONNX models.
 
 Quantizes encoder and decoder ONNX files using onnxruntime dynamic quantization.
-Also converts embed_tokens.bin to float16.
+Also converts embed_tokens.bin to float16 (if source is float32).
 
 Usage:
     python quantize.py --input output/qwen3-asr-0.6b --output output/qwen3-asr-0.6b-int8
@@ -22,11 +22,7 @@ from onnxruntime.quantization import quantize_dynamic, QuantType
 from share_weights import share_external_models
 
 
-# Unified decoder format uses decoder.onnx; legacy split format uses decoder_init + decoder_step.
-# encoder.onnx is always present.
-ONNX_FILES_BASE = ["encoder.onnx"]
-ONNX_FILES_UNIFIED = ["decoder.onnx"]
-ONNX_FILES_SPLIT = ["decoder_init.onnx", "decoder_step.onnx"]
+ONNX_FILES = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"]
 
 
 def _total_size(path: str) -> int:
@@ -94,20 +90,25 @@ def quantize_onnx_file(input_path: str, output_path: str):
 
 
 def quantize_embeddings(input_dir: str, output_dir: str):
-    """Convert embed_tokens.bin from float32 to float16."""
+    """Convert embed_tokens.bin to float16 (or copy if already float16)."""
     input_path = os.path.join(input_dir, "embed_tokens.bin")
     output_path = os.path.join(output_dir, "embed_tokens.bin")
-
-    print("  Converting embed_tokens.bin to float16...")
 
     config_path = os.path.join(input_dir, "config.json")
     with open(config_path) as f:
         config = json.load(f)
 
+    source_dtype = config.get("embed_tokens_dtype", "float32")
     shape = config["embed_tokens_shape"]
-    embed = np.fromfile(input_path, dtype=np.float32).reshape(shape)
-    embed_fp16 = embed.astype(np.float16)
-    embed_fp16.tofile(output_path)
+
+    if source_dtype == "float16":
+        print("  embed_tokens.bin already float16, copying...")
+        shutil.copy2(input_path, output_path)
+    else:
+        print("  Converting embed_tokens.bin to float16...")
+        embed = np.fromfile(input_path, dtype=np.float32).reshape(shape)
+        embed_fp16 = embed.astype(np.float16)
+        embed_fp16.tofile(output_path)
 
     input_size = os.path.getsize(input_path)
     output_size = os.path.getsize(output_path)
@@ -129,14 +130,9 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
-    # Detect unified vs split decoder format
-    unified_path = os.path.join(args.input, "decoder.onnx")
-    decoder_files = ONNX_FILES_UNIFIED if os.path.exists(unified_path) else ONNX_FILES_SPLIT
-    onnx_files = ONNX_FILES_BASE + decoder_files
-
     # Quantize ONNX files
     print("Quantizing ONNX files...")
-    for filename in onnx_files:
+    for filename in ONNX_FILES:
         input_path = os.path.join(args.input, filename)
         if not os.path.exists(input_path):
             print(f"  Skipping {filename} (not found)")
@@ -145,8 +141,17 @@ def main():
         output_path = os.path.join(args.output, filename)
         quantize_onnx_file(input_path, output_path)
 
-    # Share weights for split decoder format
-    if decoder_files == ONNX_FILES_SPLIT and not args.no_share_weights:
+    # Embed encoder weights into the INT8 .onnx proto (eliminates encoder.onnx.data)
+    encoder_out = os.path.join(args.output, "encoder.onnx")
+    encoder_data = encoder_out + ".data"
+    if os.path.exists(encoder_data):
+        print("  Embedding INT8 encoder weights into .onnx proto...")
+        enc = onnx.load(encoder_out, load_external_data=True)
+        onnx.save(enc, encoder_out)
+        os.remove(encoder_data)
+
+    # Share decoder weights
+    if not args.no_share_weights:
         print("\nSharing quantized decoder weights...")
         share_external_models(args.output)
 
