@@ -26,13 +26,10 @@ The two decoder `.onnx` files are small graph protos (~2 MB each). Both referenc
 
 ### FP32 vs INT8
 
-The export tool produces FP32 models. Quantization to INT8 is a separate step.
-
 Sizes below are for 0.6B; 1.7B models are proportionally larger.
 
 |  | FP32 | INT8 |
 |---|---|---|
-| **Directory** | `output/qwen3-asr-0.6b/` | `output/qwen3-asr-0.6b-int8/` |
 | **Encoder** | 752 MB | 552 MB |
 | **Decoder** (shared weights) | 2.4 GB | 600 MB |
 | **Embeddings** | 622 MB (float32) | 311 MB (float16) |
@@ -40,18 +37,14 @@ Sizes below are for 0.6B; 1.7B models are proportionally larger.
 
 The decoder weights are the same model exported as two graphs (prefill and autoregressive) sharing a single weights file, so both disk and runtime memory are roughly half what two separate exports would require.
 
-### AWQ Smoothing for INT8
+INT8 models are produced via AWQ smoothing followed by dynamic quantization. AWQ smoothing collects per-channel activation statistics from calibration audio, then migrates outlier activation variance from activations into RMSNorm and linear weights. The smoothed FP32 model is mathematically equivalent to the original (verified by token-for-token comparison). The subsequent INT8 quantization benefits from more uniform per-tensor weight scales.
 
-Naive `quantize_dynamic` uses per-tensor weight scales. Outlier activation channels force the quantization range wide, reducing precision for most channels. AWQ smoothing (`awq_smooth.py`) migrates per-channel activation variance into preceding RMSNorm weights before quantization, producing higher-quality INT8 models.
+### WER (LibriSpeech test-other, 200 samples)
 
-The smoothed FP32 model is mathematically equivalent to the original (verified by token-for-token comparison). The improvement shows up only after INT8 quantization.
-
-### WER Comparison (LibriSpeech test-other, 200 samples)
-
-| Model | FP32 | Naive INT8 | AWQ-smooth INT8 |
-|---|---|---|---|
-| 0.6B | 4.4% | 6.7% | TBD |
-| 1.7B | 3.8% | 11.7% | TBD |
+| Model | FP32 | INT8 |
+|---|---|---|
+| 0.6B | 4.4% | TBD |
+| 1.7B | 3.8% | TBD |
 
 ## Setup
 
@@ -63,7 +56,7 @@ uv sync
 
 ## Pipeline
 
-The full export pipeline has four stages. Each stage is a standalone script that reads from the previous stage's output directory.
+The export pipeline has three stages. Each stage is a standalone script.
 
 ### 1. Export (FP32 ONNX)
 
@@ -84,28 +77,18 @@ python validate.py --onnx-dir output/qwen3-asr-0.6b --audio tests/fixtures/test_
 
 Loads the PyTorch model and the ONNX export, runs the same audio through both, and compares encoder features and decoded tokens. Expects exact token-for-token match.
 
-### 3a. Quantize (naive INT8)
+### 3. AWQ Smooth + Quantize (INT8)
 
 ```bash
-python quantize.py --input output/qwen3-asr-0.6b --output output/qwen3-asr-0.6b-int8
-```
-
-Applies `quantize_dynamic` (per-tensor weight scales, MatMul-only for encoder) to produce INT8 models. Embeddings are converted to float16.
-
-### 3b. AWQ Smooth + Quantize (improved INT8)
-
-```bash
-# Step 1: Collect calibration activations, smooth weights, re-export FP32 ONNX
+# Collect calibration activations, smooth weights, re-export FP32 ONNX
 python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
     --output output/qwen3-asr-0.6b-smooth \
     --alpha 0.5 --n-samples 128 --verify
 
-# Step 2: Quantize the smoothed model to INT8
+# Quantize the smoothed model to INT8
 python quantize.py --input output/qwen3-asr-0.6b-smooth \
-    --output output/qwen3-asr-0.6b-smooth-int8
+    --output output/qwen3-asr-0.6b-int8
 ```
-
-AWQ smoothing collects per-channel activation statistics from 128 librispeech calibration samples, then migrates outlier activation variance into RMSNorm and linear weights. The smoothed FP32 model is mathematically equivalent to the original (verified via `--verify`). After INT8 quantization, the per-tensor scales are more uniform, reducing quantization error.
 
 Calibration activations are cached in the output directory (`calibration_activations.npz`). To sweep alpha values without re-collecting:
 
@@ -116,13 +99,12 @@ python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
     --activations-cache output/qwen3-asr-0.6b-smooth/calibration_activations.npz
 ```
 
-### 4. Evaluate WER
+### Evaluate WER
 
 ```bash
 python evaluate_wer.py \
     --models "0.6B FP32:output/qwen3-asr-0.6b" \
              "0.6B INT8:output/qwen3-asr-0.6b-int8" \
-             "0.6B smooth INT8:output/qwen3-asr-0.6b-smooth-int8" \
     --datasets librispeech-other \
     --n-samples 200 --output results.json
 ```
@@ -156,21 +138,16 @@ uv run python validate.py \
     --onnx-dir output/qwen3-asr-0.6b \
     --audio tests/fixtures/test_audio.wav
 
-# Naive INT8 quantization (~2 min)
-uv run python quantize.py \
-    --input output/qwen3-asr-0.6b \
-    --output output/qwen3-asr-0.6b-int8
-
 # AWQ smooth + re-export (~25 min, ~6 GB RAM — calibration is the bottleneck)
 uv run python awq_smooth.py \
     --model Qwen/Qwen3-ASR-0.6B \
     --output output/qwen3-asr-0.6b-smooth \
     --alpha 0.5 --n-samples 128 --verify
 
-# Quantize smoothed model
+# Quantize smoothed model to INT8
 uv run python quantize.py \
     --input output/qwen3-asr-0.6b-smooth \
-    --output output/qwen3-asr-0.6b-smooth-int8
+    --output output/qwen3-asr-0.6b-int8
 ```
 
 ### 1.7B
@@ -184,11 +161,6 @@ uv run python validate.py \
     --onnx-dir output/qwen3-asr-1.7b \
     --audio tests/fixtures/test_audio.wav
 
-# Naive INT8
-uv run python quantize.py \
-    --input output/qwen3-asr-1.7b \
-    --output output/qwen3-asr-1.7b-int8
-
 # AWQ smooth (~60 min calibration, ~12 GB RAM peak)
 # Note: do NOT use --verify for 1.7B — loading two model copies
 # plus ONNX export buffers can exceed 32 GB and trigger OOM.
@@ -197,22 +169,20 @@ uv run python awq_smooth.py \
     --output output/qwen3-asr-1.7b-smooth \
     --alpha 0.5 --n-samples 128
 
-# Quantize smoothed model
+# Quantize smoothed model to INT8
 uv run python quantize.py \
     --input output/qwen3-asr-1.7b-smooth \
-    --output output/qwen3-asr-1.7b-smooth-int8
+    --output output/qwen3-asr-1.7b-int8
 ```
 
-### WER evaluation (all variants)
+### WER evaluation
 
 ```bash
 uv run python evaluate_wer.py \
     --models "0.6B FP32:output/qwen3-asr-0.6b" \
              "0.6B INT8:output/qwen3-asr-0.6b-int8" \
-             "0.6B smooth INT8:output/qwen3-asr-0.6b-smooth-int8" \
              "1.7B FP32:output/qwen3-asr-1.7b" \
              "1.7B INT8:output/qwen3-asr-1.7b-int8" \
-             "1.7B smooth INT8:output/qwen3-asr-1.7b-smooth-int8" \
     --datasets librispeech-other \
     --n-samples 200 --output wer_results.json
 ```
@@ -223,17 +193,15 @@ After full reproduction:
 
 ```
 output/
-├── qwen3-asr-0.6b/              # FP32
-├── qwen3-asr-0.6b-int8/         # Naive INT8
-├── qwen3-asr-0.6b-smooth/       # AWQ-smoothed FP32 (+ calibration_activations.npz)
-├── qwen3-asr-0.6b-smooth-int8/  # AWQ-smoothed INT8
+├── qwen3-asr-0.6b/         # FP32
+├── qwen3-asr-0.6b-smooth/  # AWQ-smoothed FP32 (intermediate, + calibration_activations.npz)
+├── qwen3-asr-0.6b-int8/    # INT8 (quantized from smoothed FP32)
 ├── qwen3-asr-1.7b/
-├── qwen3-asr-1.7b-int8/
 ├── qwen3-asr-1.7b-smooth/
-└── qwen3-asr-1.7b-smooth-int8/
+└── qwen3-asr-1.7b-int8/
 ```
 
-Each directory is self-contained and can be used directly by ONNX Runtime consumers (e.g. [transcribe-rs](https://github.com/andrewleech/transcribe-rs)).
+Each directory is self-contained and can be used directly by ONNX Runtime consumers (e.g. [transcribe-rs](https://github.com/andrewleech/transcribe-rs)). The `-smooth` directories are intermediates used to produce INT8; the distributable artifacts are FP32 and INT8.
 
 ## Architecture
 
@@ -264,14 +232,12 @@ Tested against the native Qwen3-ASR model on LibriSpeech samples (5s to 35s).
 
 ### INT8 Quantization Quality
 
-WER measured on LibriSpeech test-other (200 samples). Naive INT8 uses `quantize_dynamic` directly on FP32 exports. AWQ-smooth INT8 applies activation-aware smoothing before quantization.
+WER measured on LibriSpeech test-other (200 samples).
 
-| Model | FP32 WER | Naive INT8 WER | AWQ-smooth INT8 WER |
-|---|---|---|---|
-| 0.6B | 4.4% | 6.7% | TBD |
-| 1.7B | 3.8% | 11.7% | TBD |
-
-The 1.7B naive INT8 model has a specific failure mode where ~12% of samples emit the raw text "language English asr text" instead of producing the `<asr_text>` special token, inflating WER.
+| Model | FP32 WER | INT8 WER |
+|---|---|---|
+| 0.6B | 4.4% | TBD |
+| 1.7B | 3.8% | TBD |
 
 ## DirectML Compatibility
 
