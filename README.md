@@ -14,88 +14,130 @@ Each export produces a directory containing:
 
 | File | Description |
 |---|---|
-| `encoder.onnx` (+`.data`) | Audio encoder (Conv2D stem + transformer + MLP projection) |
-| `decoder_init.onnx` (+`.data`) | Decoder prefill (full sequence, outputs KV cache) |
-| `decoder_step.onnx` (+`.data`) | Decoder autoregressive step (single token + KV cache) |
-| `embed_tokens.bin` | Token embedding matrix [vocab_size, hidden_size] |
+| `encoder.onnx` | Audio encoder (Conv2D stem + transformer + MLP projection), weights embedded in proto |
+| `decoder_init.onnx` | Decoder prefill (full sequence, outputs KV cache) |
+| `decoder_step.onnx` | Decoder autoregressive step (single token + KV cache) |
+| `decoder_weights.data` | Shared external weights for both decoder models |
+| `embed_tokens.bin` | Token embedding matrix `[vocab_size, hidden_size]` as raw float32 (or float16 for INT8) |
 | `tokenizer.json` | HuggingFace tokenizer |
 | `config.json` | Architecture config + special tokens + mel params |
 
-The `.onnx.data` files contain the model weights (external data format) and must be kept alongside the `.onnx` files.
+The two decoder `.onnx` files are small graph protos (~2 MB each). Both reference the same `decoder_weights.data` file via ONNX external data pointers. Encoder weights are embedded directly in the `.onnx` proto (under the 2 GB protobuf limit for both model sizes).
 
 ### FP32 vs INT8
 
-The export tool produces FP32 models. An optional quantization step produces INT8 models.
+The export tool produces FP32 models. Quantization to INT8 is a separate step.
 
 Sizes below are for 0.6B; 1.7B models are proportionally larger.
 
 |  | FP32 | INT8 |
 |---|---|---|
 | **Directory** | `output/qwen3-asr-0.6b/` | `output/qwen3-asr-0.6b-int8/` |
-| **Encoder** | 718 MB | 552 MB |
-| **Decoder** (init+step) | 2x 2.3 GB | 2x 1.7 GB |
-| **Embeddings** | 594 MB (float32) | 297 MB (float16) |
-| **Total disk** | ~5.9 GB | ~4.2 GB |
-| **Accuracy (≤12s)** | Exact match with native model | Exact match with FP32 |
-| **Accuracy (30s+)** | Exact match with native model | Degrades (0-79% token match) |
-| **Execution providers** | Any (CPU, CUDA, DirectML, CoreML) | Requires provider with ConvInteger/MatMulInteger support (CUDA, DirectML). **Does not work with CPUExecutionProvider.** |
+| **Encoder** | 752 MB | 552 MB |
+| **Decoder** (shared weights) | 2.4 GB | 600 MB |
+| **Embeddings** | 622 MB (float32) | 311 MB (float16) |
+| **Total disk** | ~3.8 GB | ~1.1 GB |
 
-**Use FP32 unless you have a specific reason to use INT8.** FP32 works on all execution providers and produces accurate results at all audio durations. The INT8 size reduction (~30%) comes with significant accuracy loss on longer audio and restricted provider compatibility.
+The decoder weights are the same model exported as two graphs (prefill and autoregressive) sharing a single weights file, so both disk and runtime memory are roughly half what two separate exports would require.
 
-The decoder weights are the same model exported as two graphs (prefill and autoregressive), so runtime memory is roughly half the total disk size.
+### AWQ Smoothing for INT8
+
+Naive `quantize_dynamic` uses per-tensor weight scales. Outlier activation channels force the quantization range wide, reducing precision for most channels. AWQ smoothing (`awq_smooth.py`) migrates per-channel activation variance into preceding RMSNorm weights before quantization, producing higher-quality INT8 models.
+
+The smoothed FP32 model is mathematically equivalent to the original (verified by token-for-token comparison). The improvement shows up only after INT8 quantization.
+
+### WER Comparison (LibriSpeech test-other, 200 samples)
+
+| Model | FP32 | Naive INT8 | AWQ-smooth INT8 |
+|---|---|---|---|
+| 0.6B | 4.4% | 6.7% | TBD |
+| 1.7B | 3.8% | 11.7% | TBD |
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
+# or with uv:
+uv sync
 ```
 
-## Usage
+## Pipeline
 
-### Export
+The full export pipeline has four stages. Each stage is a standalone script that reads from the previous stage's output directory.
+
+### 1. Export (FP32 ONNX)
 
 ```bash
-# 0.6B (default)
 python export.py --model Qwen/Qwen3-ASR-0.6B
-
-# 1.7B
 python export.py --model Qwen/Qwen3-ASR-1.7B
-
-# Additional options
-python export.py --model Qwen/Qwen3-ASR-0.6B --output /path/to/dir --device cuda --opset 18
-python export.py --model Qwen/Qwen3-ASR-0.6B --skip-encoder   # re-export decoders only
-python export.py --model Qwen/Qwen3-ASR-0.6B --skip-decoder   # re-export encoder only
 ```
 
-Output directories are derived from the model name (`output/qwen3-asr-0.6b`, `output/qwen3-asr-1.7b`) unless overridden with `--output`.
+Produces `output/qwen3-asr-0.6b/` (or `1.7b`) with FP32 ONNX files. Encoder weights are embedded in the proto; decoder init and step share a single external weights file via `share_weights.py`.
 
-### Validate
+Options: `--skip-encoder`, `--skip-decoder`, `--device cuda`, `--opset 18`.
+
+### 2. Validate (FP32 vs PyTorch)
 
 ```bash
 python validate.py --onnx-dir output/qwen3-asr-0.6b --audio tests/fixtures/test_audio.wav
 ```
 
-### Quantize (INT8)
+Loads the PyTorch model and the ONNX export, runs the same audio through both, and compares encoder features and decoded tokens. Expects exact token-for-token match.
+
+### 3a. Quantize (naive INT8)
 
 ```bash
 python quantize.py --input output/qwen3-asr-0.6b --output output/qwen3-asr-0.6b-int8
 ```
 
-### Upload to HuggingFace
+Applies `quantize_dynamic` (per-tensor weight scales, MatMul-only for encoder) to produce INT8 models. Embeddings are converted to float16.
+
+### 3b. AWQ Smooth + Quantize (improved INT8)
 
 ```bash
+# Step 1: Collect calibration activations, smooth weights, re-export FP32 ONNX
+python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
+    --output output/qwen3-asr-0.6b-smooth \
+    --alpha 0.5 --n-samples 128 --verify
+
+# Step 2: Quantize the smoothed model to INT8
+python quantize.py --input output/qwen3-asr-0.6b-smooth \
+    --output output/qwen3-asr-0.6b-smooth-int8
+```
+
+AWQ smoothing collects per-channel activation statistics from 128 librispeech calibration samples, then migrates outlier activation variance into RMSNorm and linear weights. The smoothed FP32 model is mathematically equivalent to the original (verified via `--verify`). After INT8 quantization, the per-tensor scales are more uniform, reducing quantization error.
+
+Calibration activations are cached in the output directory (`calibration_activations.npz`). To sweep alpha values without re-collecting:
+
+```bash
+python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
+    --output output/qwen3-asr-0.6b-smooth-a07 \
+    --alpha 0.7 \
+    --activations-cache output/qwen3-asr-0.6b-smooth/calibration_activations.npz
+```
+
+### 4. Evaluate WER
+
+```bash
+python evaluate_wer.py \
+    --models "0.6B FP32:output/qwen3-asr-0.6b" \
+             "0.6B INT8:output/qwen3-asr-0.6b-int8" \
+             "0.6B smooth INT8:output/qwen3-asr-0.6b-smooth-int8" \
+    --datasets librispeech-other \
+    --n-samples 200 --output results.json
+```
+
+Streams samples from HuggingFace datasets (no full download), runs ONNX inference for each model, and reports WER. Supports `librispeech-other` and `ami-sdm` datasets.
+
+### Other Tools
+
+```bash
+# Compare inference paths (native PyTorch, wrapper, FP32 ONNX, INT8 ONNX)
+python compare.py --audio tests/fixtures/librispeech_0.wav
+
+# Upload to HuggingFace
 python upload.py --input output/qwen3-asr-0.6b --repo andrewleech/qwen3-asr-0.6b-onnx
 ```
-
-### Compare inference paths
-
-```bash
-python compare.py --audio tests/fixtures/librispeech_0.wav tests/fixtures/librispeech_30s.wav \
-    --ground-truth "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL" \
-    "LAW SEEMED TO HIM WELL ENOUGH AS A SCIENCE..."
-```
-
-Runs transcription through 4 paths (native model, PyTorch wrapper, FP32 ONNX, INT8 ONNX) and reports text, timing, token agreement, and encoder feature differences.
 
 ## Architecture
 
@@ -111,17 +153,29 @@ Identical to Whisper: 16kHz, 128 bins, 25ms window (n_fft=400), 10ms hop (hop_le
 
 ## Comparison Results
 
+### FP32 ONNX vs PyTorch
+
 Tested against the native Qwen3-ASR model on LibriSpeech samples (5s to 35s).
 
-| Duration | Native vs FP32 | Wrapper vs FP32 | INT8 vs FP32 | Encoder max_diff |
-|----------|---------------|-----------------|-------------|-----------------|
-| 5-12s | Exact token match | Exact token match | Exact token match | < 6e-6 |
-| 30s | Exact token match | Exact token match | ~79% tokens | < 6e-6 |
-| 32-35s | Same words, punctuation differs | Exact token match | Degraded | < 6e-6 |
+| Duration | Native vs FP32 | Wrapper vs FP32 | Encoder max_diff |
+|----------|---------------|-----------------|-----------------|
+| 5-12s | Exact token match | Exact token match | < 6e-6 |
+| 30s | Exact token match | Exact token match | < 6e-6 |
+| 32-35s | Same words, punctuation differs | Exact token match | < 6e-6 |
 
 - **Wrapper vs FP32**: Always exact token match — the ONNX export faithfully reproduces the PyTorch wrapper.
 - **Native vs FP32**: Identical on short audio. On long audio (>30s), SDPA vs eager attention causes punctuation-level divergence; word content matches.
-- **INT8**: Exact on short audio. Degrades on long audio due to quantization error accumulation.
+
+### INT8 Quantization Quality
+
+WER measured on LibriSpeech test-other (200 samples). Naive INT8 uses `quantize_dynamic` directly on FP32 exports. AWQ-smooth INT8 applies activation-aware smoothing before quantization.
+
+| Model | FP32 WER | Naive INT8 WER | AWQ-smooth INT8 WER |
+|---|---|---|---|
+| 0.6B | 4.4% | 6.7% | TBD |
+| 1.7B | 3.8% | 11.7% | TBD |
+
+The 1.7B naive INT8 model has a specific failure mode where ~12% of samples emit the raw text "language English asr text" instead of producing the `<asr_text>` special token, inflating WER.
 
 ## DirectML Compatibility
 
