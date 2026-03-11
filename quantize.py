@@ -53,8 +53,13 @@ def _simplify_if_needed(input_path: str) -> str:
     return input_path
 
 
-def quantize_onnx_file(input_path: str, output_path: str):
-    """Apply INT8 dynamic quantization to an ONNX file."""
+def quantize_onnx_file(input_path: str, output_path: str, op_types_to_quantize=None):
+    """Apply INT8 dynamic quantization to an ONNX file.
+
+    op_types_to_quantize: if given, restricts quantization to those op types.
+    For the encoder, pass ['MatMul'] to skip Conv layers — Conv quantization produces
+    ConvInteger ops not supported by ORT <1.24 on Linux.
+    """
     print(f"  Quantizing {os.path.basename(input_path)}...")
 
     # Try direct quantization first, fall back to simplification
@@ -63,6 +68,7 @@ def quantize_onnx_file(input_path: str, output_path: str):
         quantize_dynamic(
             input_path,
             output_path,
+            op_types_to_quantize=op_types_to_quantize,
             weight_type=QuantType.QInt8,
             use_external_data_format=True,
         )
@@ -73,6 +79,7 @@ def quantize_onnx_file(input_path: str, output_path: str):
         quantize_dynamic(
             tmp_path,
             output_path,
+            op_types_to_quantize=op_types_to_quantize,
             weight_type=QuantType.QInt8,
             use_external_data_format=True,
         )
@@ -131,6 +138,8 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     # Quantize ONNX files
+    # Encoder: MatMul-only — Conv quantization produces ConvInteger ops not supported by ORT <1.24.
+    # Decoders: all ops (decoders have no Conv layers).
     print("Quantizing ONNX files...")
     for filename in ONNX_FILES:
         input_path = os.path.join(args.input, filename)
@@ -139,7 +148,8 @@ def main():
             continue
 
         output_path = os.path.join(args.output, filename)
-        quantize_onnx_file(input_path, output_path)
+        encoder_only_matmul = ["MatMul"] if filename == "encoder.onnx" else None
+        quantize_onnx_file(input_path, output_path, op_types_to_quantize=encoder_only_matmul)
 
     # Embed encoder weights into the INT8 .onnx proto (eliminates encoder.onnx.data)
     encoder_out = os.path.join(args.output, "encoder.onnx")
