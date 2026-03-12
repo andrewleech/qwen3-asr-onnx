@@ -53,36 +53,42 @@ def _simplify_if_needed(input_path: str) -> str:
     return input_path
 
 
-def quantize_onnx_file(input_path: str, output_path: str, op_types_to_quantize=None):
-    """Apply INT8 dynamic quantization to an ONNX file.
+def quantize_onnx_file(
+    input_path: str,
+    output_path: str,
+    op_types_to_quantize=None,
+    weight_type=QuantType.QInt8,
+    nodes_to_exclude=None,
+):
+    """Apply dynamic quantization to an ONNX file.
 
     op_types_to_quantize: if given, restricts quantization to those op types.
     For the encoder, pass ['MatMul'] to skip Conv layers — Conv quantization produces
     ConvInteger ops not supported by ORT <1.24 on Linux.
+    weight_type: QuantType.QInt8 (default) or QuantType.QInt16.
+    nodes_to_exclude: list of node names to keep in FP32 (e.g. lm_head).
     """
     print(f"  Quantizing {os.path.basename(input_path)}...")
+    if nodes_to_exclude:
+        print(f"    Excluding nodes: {nodes_to_exclude}")
+
+    quant_kwargs = dict(
+        op_types_to_quantize=op_types_to_quantize,
+        weight_type=weight_type,
+        use_external_data_format=True,
+    )
+    if nodes_to_exclude:
+        quant_kwargs["nodes_to_exclude"] = nodes_to_exclude
 
     # Try direct quantization first, fall back to simplification
     tmp_path = None
     try:
-        quantize_dynamic(
-            input_path,
-            output_path,
-            op_types_to_quantize=op_types_to_quantize,
-            weight_type=QuantType.QInt8,
-            use_external_data_format=True,
-        )
+        quantize_dynamic(input_path, output_path, **quant_kwargs)
     except Exception:
         # Shape inference may fail on dynamo-exported models; simplify first
         print(f"    Direct quantization failed, trying with onnxsim...")
         tmp_path = _simplify_if_needed(input_path)
-        quantize_dynamic(
-            tmp_path,
-            output_path,
-            op_types_to_quantize=op_types_to_quantize,
-            weight_type=QuantType.QInt8,
-            use_external_data_format=True,
-        )
+        quantize_dynamic(tmp_path, output_path, **quant_kwargs)
 
     if tmp_path and tmp_path != input_path:
         os.unlink(tmp_path)
@@ -133,14 +139,36 @@ def main():
         action="store_true",
         help="Skip weight sharing for split decoder after quantization",
     )
+    parser.add_argument(
+        "--nodes-to-exclude",
+        type=str,
+        default=None,
+        help="Comma-separated node names to exclude from quantization (keep in FP32)",
+    )
+    parser.add_argument(
+        "--weight-type",
+        type=str,
+        default="int8",
+        choices=["int8", "int16"],
+        help="Quantization weight type (default: int8)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
 
+    # Parse weight type
+    wtype_map = {"int8": QuantType.QInt8, "int16": QuantType.QInt16}
+    weight_type = wtype_map[args.weight_type]
+
+    # Parse nodes to exclude
+    exclude_nodes = None
+    if args.nodes_to_exclude:
+        exclude_nodes = [n.strip() for n in args.nodes_to_exclude.split(",")]
+
     # Quantize ONNX files
     # Encoder: MatMul-only — Conv quantization produces ConvInteger ops not supported by ORT <1.24.
     # Decoders: all ops (decoders have no Conv layers).
-    print("Quantizing ONNX files...")
+    print(f"Quantizing ONNX files (weight_type={args.weight_type})...")
     for filename in ONNX_FILES:
         input_path = os.path.join(args.input, filename)
         if not os.path.exists(input_path):
@@ -149,7 +177,14 @@ def main():
 
         output_path = os.path.join(args.output, filename)
         encoder_only_matmul = ["MatMul"] if filename == "encoder.onnx" else None
-        quantize_onnx_file(input_path, output_path, op_types_to_quantize=encoder_only_matmul)
+        # Only apply node exclusions to decoder files (encoder uses op_type filtering)
+        file_exclude = exclude_nodes if filename != "encoder.onnx" else None
+        quantize_onnx_file(
+            input_path, output_path,
+            op_types_to_quantize=encoder_only_matmul,
+            weight_type=weight_type,
+            nodes_to_exclude=file_exclude,
+        )
 
     # Embed encoder weights into the INT8 .onnx proto (eliminates encoder.onnx.data)
     encoder_out = os.path.join(args.output, "encoder.onnx")

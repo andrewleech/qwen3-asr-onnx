@@ -41,12 +41,14 @@ INT8 models are produced via AWQ smoothing followed by dynamic quantization. AWQ
 
 ### WER (LibriSpeech test-other, 200 samples)
 
-| Model | FP32 | INT8 (AWQ-smoothed) |
-|---|---|---|
-| 0.6B | 4.4% | 5.6% |
-| 1.7B | 3.8% | — |
+| Model | FP32 | INT8 (AWQ α=0.5) | INT8 (AWQ α=0.2) |
+|---|---|---|---|
+| 0.6B | 4.4% | 5.6% | 5.2% |
+| 1.7B | 3.8% | — | — |
 
-1.7B INT8 is not yet available. AWQ smoothing for 1.7B causes degraded special token prediction under quantization; this requires further investigation (e.g. excluding `lm_head` from smoothing).
+α=0.2 is the recommended AWQ smoothing strength for 0.6B. It reduces the INT8 WER penalty from +1.2pp to +0.8pp compared to the default α=0.5. On LibriSpeech test-other, α=0.2 INT8 (5.2% WER) outperforms Parakeet-TDT 0.6B INT8 (5.5% WER) at comparable inference speed.
+
+1.7B INT8 is not yet available. AWQ smoothing for 1.7B causes degraded special token prediction under quantization; this requires further investigation.
 
 ## Setup
 
