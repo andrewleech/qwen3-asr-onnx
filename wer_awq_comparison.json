@@ -1,0 +1,26 @@
+[
+  {
+    "dataset": "LibriSpeech test-other",
+    "model": "0.6B FP32",
+    "n": 200,
+    "wer": 4.4243
+  },
+  {
+    "dataset": "LibriSpeech test-other",
+    "model": "0.6B INT8 naive",
+    "n": 200,
+    "wer": 6.7465
+  },
+  {
+    "dataset": "LibriSpeech test-other",
+    "model": "0.6B smooth INT8",
+    "n": 200,
+    "wer": 5.6221
+  },
+  {
+    "dataset": "LibriSpeech test-other",
+    "model": "1.7B FP32",
+    "n": 200,
+    "wer": 3.7888
+  }
+]

@@ -41,10 +41,12 @@ INT8 models are produced via AWQ smoothing followed by dynamic quantization. AWQ
 
 ### WER (LibriSpeech test-other, 200 samples)
 
-| Model | FP32 | INT8 |
+| Model | FP32 | INT8 (AWQ-smoothed) |
 |---|---|---|
-| 0.6B | 4.4% | TBD |
-| 1.7B | 3.8% | TBD |
+| 0.6B | 4.4% | 5.6% |
+| 1.7B | 3.8% | — |
+
+1.7B INT8 is not yet available. AWQ smoothing for 1.7B causes degraded special token prediction under quantization; this requires further investigation (e.g. excluding `lm_head` from smoothing).
 
 ## Setup
 
@@ -234,10 +236,14 @@ Tested against the native Qwen3-ASR model on LibriSpeech samples (5s to 35s).
 
 WER measured on LibriSpeech test-other (200 samples).
 
-| Model | FP32 WER | INT8 WER |
-|---|---|---|
-| 0.6B | 4.4% | TBD |
-| 1.7B | 3.8% | TBD |
+| Model | FP32 WER | INT8 naive | INT8 AWQ-smoothed |
+|---|---|---|---|
+| 0.6B | 4.4% | 6.7% | 5.6% |
+| 1.7B | 3.8% | — | — |
+
+AWQ smoothing reduces the INT8 WER penalty from +2.3pp to +1.2pp for 0.6B. Naive INT8 uses `quantize_dynamic` directly on FP32 weights. AWQ-smoothed INT8 first migrates per-channel activation variance into weights, then quantizes.
+
+1.7B INT8 quantization (both naive and smoothed) produces degraded output due to special token prediction failures. This is under investigation.
 
 ## DirectML Compatibility
 

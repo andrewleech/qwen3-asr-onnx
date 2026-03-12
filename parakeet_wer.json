@@ -1,0 +1,8 @@
+[
+  {
+    "dataset": "LibriSpeech test-other",
+    "model": "Parakeet INT8",
+    "n": 200,
+    "wer": 5.451
+  }
+]
