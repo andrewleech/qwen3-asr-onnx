@@ -21,7 +21,9 @@ MODEL_CARD_TEMPLATE = """\
 ---
 license: apache-2.0
 base_model: {base_model}
+pipeline_tag: automatic-speech-recognition
 tags:
+  - automatic-speech-recognition
   - onnx
   - asr
   - speech-recognition
@@ -65,8 +67,10 @@ engine auto-detects INT8 models when present.
 |---|---|
 | `embed_tokens.bin` | Token embedding matrix [{vocab_size}, {hidden_size}], {embed_dtype} |
 | `tokenizer.json` | HuggingFace tokenizer |
-| `config.json` | Architecture config |
-| `{tar_name}` | All files in a single archive for download |
+| `config.json` | Architecture config, special tokens, mel params |
+| `preprocessor_config.json` | Mel spectrogram parameters (WhisperFeatureExtractor format) |
+| `test_wavs/0.wav` | Short test audio clip (LibriSpeech) |
+| `{tar_name}` | Quantized model + shared files in a single archive |
 
 ## Weight Sharing
 

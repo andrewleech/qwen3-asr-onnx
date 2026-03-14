@@ -152,6 +152,40 @@ def verify_special_tokens(model_id: str):
     print("All special token IDs verified.")
 
 
+def write_preprocessor_config(output_dir: str):
+    """
+    Write preprocessor_config.json with mel spectrogram parameters.
+
+    Uses HF WhisperFeatureExtractor field names for compatibility with
+    tools that recognise this format (faster-whisper, transformers, etc.).
+    Parameters are identical to Whisper and fixed for all Qwen3-ASR model sizes.
+    """
+    chunk_length = 30
+    sample_rate = 16000
+    hop_length = 160
+    n_fft = 400
+    n_mels = 128
+
+    config = {
+        "feature_extractor_type": "WhisperFeatureExtractor",
+        "feature_size": n_mels,
+        "sampling_rate": sample_rate,
+        "hop_length": hop_length,
+        "n_fft": n_fft,
+        "chunk_length": chunk_length,
+        "n_samples": chunk_length * sample_rate,
+        "nb_max_frames": chunk_length * sample_rate // hop_length,
+        "padding_side": "right",
+        "padding_value": 0.0,
+        "return_attention_mask": False,
+    }
+
+    output_path = os.path.join(output_dir, "preprocessor_config.json")
+    with open(output_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"Preprocessor config saved to {output_path}")
+
+
 def write_config(model, output_dir: str, embed_shape: tuple):
     """
     Write config.json with architecture parameters, special tokens, and mel params.
@@ -335,6 +369,7 @@ def main():
     # Write config
     print("\n=== Writing config ===")
     write_config(model, args.output, embed_shape)
+    write_preprocessor_config(args.output)
 
     print(f"\nExport complete. Output directory: {args.output}")
     print("Files:")

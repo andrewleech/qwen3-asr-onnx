@@ -143,17 +143,21 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     # Quantize each decoder file
+    bits_suffix = f".int{args.bits}"
     for name in args.decoders:
         src = os.path.join(args.input, f"{name}.onnx")
         if not os.path.exists(src):
             print(f"  Skipping {name}.onnx (not found)")
             continue
-        dst = os.path.join(args.output, f"{name}.onnx")
+        dst = os.path.join(args.output, f"{name}{bits_suffix}.onnx")
         quantize_decoder(src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data)
 
     # Copy everything else unchanged
     skip_exts = {".onnx", ".data"}
+    # Skip the FP32 source decoder files (we wrote quantized versions above)
     skip_names = {f"{n}.onnx" for n in args.decoders} | {f"{n}.onnx.data" for n in args.decoders}
+    # Also skip any already-quantized variants of the same decoders in the source dir
+    skip_names |= {f"{n}{bits_suffix}.onnx" for n in args.decoders} | {f"{n}{bits_suffix}.onnx.data" for n in args.decoders}
     for fname in os.listdir(args.input):
         if fname in skip_names:
             continue
