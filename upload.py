@@ -2,12 +2,15 @@
 """
 Upload ONNX model files to HuggingFace Hub.
 
-Uploads a combined FP32 + INT8 release directory, replacing all existing
-repo contents. Generates a model card documenting both variants.
+Uploads a combined FP32 + quantized release directory, replacing all existing
+repo contents. Generates a model card based on which variants are present.
 
 Usage:
+    # 0.6B (FP32 + INT8)
     python upload.py --input release/qwen3-asr-0.6b --repo andrewleech/qwen3-asr-0.6b-onnx --model Qwen/Qwen3-ASR-0.6B
-    python upload.py --input release/qwen3-asr-0.6b --repo andrewleech/qwen3-asr-0.6b-onnx --model Qwen/Qwen3-ASR-0.6B --tar
+
+    # 1.7B (FP32 + int4)
+    python upload.py --input release/qwen3-asr-1.7b --repo andrewleech/qwen3-asr-1.7b-onnx --model Qwen/Qwen3-ASR-1.7B
 """
 
 import argparse
@@ -17,7 +20,7 @@ import os
 from huggingface_hub import HfApi
 
 
-MODEL_CARD_TEMPLATE = """\
+MODEL_CARD_HEADER = """\
 ---
 license: apache-2.0
 base_model: {base_model}
@@ -37,9 +40,7 @@ library_name: onnxruntime
 
 ONNX export of [{base_model}](https://huggingface.co/{base_model}) for use with ONNX Runtime.
 
-Includes both FP32 and INT8 (dynamic quantization) variants. The INT8 files use `.int8.` naming
-and can coexist in the same directory as FP32. The [transcribe-rs](https://github.com/andrewleech/transcribe-rs)
-engine auto-detects INT8 models when present.
+{variants_intro}
 
 ## Files
 
@@ -50,9 +51,12 @@ engine auto-detects INT8 models when present.
 | `encoder.onnx` | Audio encoder (mel → features) |
 | `decoder_init.onnx` | Decoder prefill (embeddings → logits + KV cache) |
 | `decoder_step.onnx` | Decoder step (token + KV cache → logits + KV cache) |
-| `decoder_weights.data` | Shared external weights for both decoder models |
+| `decoder_weights.data` | Shared external weights for both FP32 decoder models |
+"""
 
-### INT8
+INT8_SECTION = """\
+
+### INT8 (AWQ-smoothed, α=0.2)
 
 | File | Description |
 |---|---|
@@ -60,6 +64,23 @@ engine auto-detects INT8 models when present.
 | `decoder_init.int8.onnx` | INT8 decoder prefill |
 | `decoder_step.int8.onnx` | INT8 decoder step |
 | `decoder_weights.int8.data` | Shared external weights for INT8 decoders |
+"""
+
+INT4_SECTION = """\
+
+### int4 (MatMulNBits, GPTQ decoder_init + RTN al4 decoder_step)
+
+| File | Description |
+|---|---|
+| `decoder_init.int4.onnx` | int4 decoder prefill (GPTQ calibrated) |
+| `decoder_init.int4.onnx.data` | Weights for int4 decoder_init |
+| `decoder_step.int4.onnx` | int4 decoder step (RTN accuracy_level=4) |
+| `decoder_step.int4.onnx.data` | Weights for int4 decoder_step |
+
+The encoder is not quantized for int4; use `encoder.onnx` (FP32).
+"""
+
+MODEL_CARD_FOOTER = """\
 
 ### Shared
 
@@ -74,13 +95,14 @@ engine auto-detects INT8 models when present.
 
 ## Weight Sharing
 
-Each decoder variant (FP32 and INT8) uses a split decoder architecture with shared weights:
-`decoder_init` and `decoder_step` reference the same external data file (`decoder_weights.data`
-or `decoder_weights.int8.data`), eliminating duplicate weight storage.
+FP32 and INT8 decoders use a split architecture where `decoder_init` and `decoder_step`
+share a single external weights file (`decoder_weights.data` / `decoder_weights.int8.data`),
+eliminating duplicate weight storage. int4 decoders have separate data files per model.
 
 ## Mel Spectrogram Parameters
 
 Identical to Whisper: 16kHz, 128 bins, n_fft=400, hop_length=160, Hann window, Slaney mel scale, 0-8kHz.
+Also documented in `preprocessor_config.json` (WhisperFeatureExtractor format).
 
 ## Inference Pipeline
 
@@ -92,7 +114,7 @@ Identical to Whisper: 16kHz, 128 bins, n_fft=400, hop_length=160, Hann window, S
 6. Run `decoder_init.onnx`: combined embeddings → logits + KV cache
 7. Greedy decode with `decoder_step.onnx` until EOS
 
-For INT8 inference, substitute `*.int8.onnx` for the encoder and decoder models.
+Substitute `*.int8.onnx` or `*.int4.onnx` files for quantized inference.
 
 ## Prompt Template
 
@@ -114,6 +136,52 @@ For INT8 inference, substitute `*.int8.onnx` for the encoder and decoder models.
 
 Exported with [qwen3-asr-onnx](https://github.com/andrewleech/qwen3-asr-onnx).
 """
+
+
+def build_model_card(input_dir, base_model, model_name, embed_dtype, vocab_size, hidden_size, tar_name):
+    """Build model card content based on which variants are present in input_dir."""
+    files = set(os.listdir(input_dir))
+    has_int8 = any(f.endswith(".int8.onnx") for f in files)
+    has_int4 = any(f.endswith(".int4.onnx") for f in files)
+
+    variants = []
+    if has_int8:
+        variants.append("INT8 (AWQ-smoothed dynamic quantization)")
+    if has_int4:
+        variants.append("int4 MatMulNBits")
+
+    if variants:
+        variants_intro = (
+            f"Includes FP32 and {' and '.join(variants)} variants. "
+            "Quantized files use `.int8.`/`.int4.` naming and coexist with FP32 in the same directory. "
+            "The [transcribe-rs](https://github.com/andrewleech/transcribe-rs) engine "
+            "auto-detects quantized models by file presence."
+        )
+    else:
+        variants_intro = (
+            "FP32 export for use with ONNX Runtime. "
+            "The [transcribe-rs](https://github.com/andrewleech/transcribe-rs) engine "
+            "loads these files directly."
+        )
+
+    card = MODEL_CARD_HEADER.format(
+        base_model=base_model,
+        model_name=model_name,
+        variants_intro=variants_intro,
+    )
+    if has_int8:
+        card += INT8_SECTION
+    if has_int4:
+        card += INT4_SECTION
+    card += MODEL_CARD_FOOTER.format(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        embed_dtype=embed_dtype,
+        tar_name=tar_name,
+    )
+
+    variants_str = "+".join(["FP32"] + (["INT8"] if has_int8 else []) + (["int4"] if has_int4 else []))
+    return card, variants_str
 
 
 def main():
@@ -139,22 +207,18 @@ def main():
     model_name = base_model.rsplit("/", 1)[-1]
     tar_name = os.path.basename(args.input.rstrip("/")) + ".tar.gz"
 
-    # Write model card
-    readme_content = MODEL_CARD_TEMPLATE.format(
-        base_model=base_model,
-        model_name=model_name,
-        embed_dtype=embed_dtype,
-        vocab_size=vocab_size,
-        hidden_size=hidden_size,
-        tar_name=tar_name,
+    # Build and write model card
+    readme_content, variants_str = build_model_card(
+        args.input, base_model, model_name, embed_dtype, vocab_size, hidden_size, tar_name
     )
     readme_path = os.path.join(args.input, "README.md")
     with open(readme_path, "w") as f:
         f.write(readme_content)
-    print(f"Wrote model card: {readme_path}")
+    print(f"Wrote model card: {readme_path} ({variants_str})")
 
     if args.dry_run:
         print("Dry run — skipping upload")
+        print(readme_content)
         return
 
     api = HfApi()
@@ -162,9 +226,6 @@ def main():
     # Create repo
     print(f"Creating repo {args.repo}...")
     api.create_repo(args.repo, exist_ok=True, private=args.private)
-
-    # Build upload path: either the directory alone, or a temp dir including the tar
-    upload_dir = args.input
 
     # If --tar, copy the tar.gz into the upload directory
     tar_path = args.input.rstrip("/") + ".tar.gz"
@@ -179,11 +240,11 @@ def main():
             print(f"WARNING: --tar specified but {tar_path} not found")
 
     # Upload, replacing all existing contents
-    print(f"Uploading {upload_dir} to {args.repo}...")
+    print(f"Uploading {args.input} to {args.repo}...")
     api.upload_folder(
-        folder_path=upload_dir,
+        folder_path=args.input,
         repo_id=args.repo,
-        commit_message=f"Upload {model_name} ONNX (FP32 + INT8, shared weights)",
+        commit_message=f"Upload {model_name} ONNX ({variants_str})",
         delete_patterns=["*"],
     )
 
