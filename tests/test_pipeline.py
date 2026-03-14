@@ -56,12 +56,21 @@ def mel(audio):
 
 @pytest.fixture(scope="module")
 def pytorch_model():
-    model = AutoModel.from_pretrained(
-        "Qwen/Qwen3-ASR-0.6B",
-        torch_dtype=torch.float32,
-        device_map="cpu",
-        trust_remote_code=True,
-    )
+    try:
+        model = AutoModel.from_pretrained(
+            "Qwen/Qwen3-ASR-0.6B",
+            torch_dtype=torch.float32,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+    except ValueError as e:
+        print(f"AutoModel.from_pretrained failed ({e}), falling back to direct import")
+        from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+            Qwen3ASRForConditionalGeneration,
+        )
+        model = Qwen3ASRForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen3-ASR-0.6B", torch_dtype=torch.float32, device_map="cpu",
+        )
     model.eval()
     return model
 
