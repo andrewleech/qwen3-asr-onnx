@@ -4,9 +4,8 @@ Export [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) and [Qwen3-A
 
 Pre-exported models are available on HuggingFace:
 
-- [andrewleech/qwen3-asr-0.6b-onnx](https://huggingface.co/andrewleech/qwen3-asr-0.6b-onnx) (FP32)
-- [andrewleech/qwen3-asr-0.6b-onnx-int8](https://huggingface.co/andrewleech/qwen3-asr-0.6b-onnx-int8) (INT8, AWQ α=0.2)
-- [andrewleech/qwen3-asr-1.7b-onnx](https://huggingface.co/andrewleech/qwen3-asr-1.7b-onnx) (FP32)
+- [andrewleech/qwen3-asr-0.6b-onnx](https://huggingface.co/andrewleech/qwen3-asr-0.6b-onnx) — FP32 + INT8 (AWQ α=0.2)
+- [andrewleech/qwen3-asr-1.7b-onnx](https://huggingface.co/andrewleech/qwen3-asr-1.7b-onnx) — FP32 + int4 (GPTQ+RTN al4)
 
 ## Output Files
 
