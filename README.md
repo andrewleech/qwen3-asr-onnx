@@ -135,11 +135,11 @@ python collect_gptq_calib.py \
     --model output/qwen3-asr-1.7b \
     --n-samples 32 \
     --decoder-steps 8 \
-    --output calibration_cache/1.7b_gptq_init.pkl \
+    --output calibration_cache/1.7b_gptq_init.npz \
     --target decoder_init
 ```
 
-`decoder_step` calibration (32 samples × 8 steps × KV cache ~20 MB each ≈ 5 GB pkl) is impractical to load alongside an 8.8 GB model. The recommended hybrid uses GPTQ for `decoder_init` and RTN al4 for `decoder_step`:
+`decoder_step` calibration (32 samples × 8 steps × KV cache ~20 MB each ≈ 5 GB .npz) is impractical to load alongside an 8.8 GB model. The recommended hybrid uses GPTQ for `decoder_init` and RTN al4 for `decoder_step`:
 
 ```bash
 # GPTQ decoder_init (requires config.json hidden during run — see note below)
@@ -148,7 +148,7 @@ python quantize_nbits.py \
     --input output/qwen3-asr-1.7b \
     --output output/qwen3-asr-1.7b-gptq-int4 \
     --bits 4 --block-size 64 --algo gptq \
-    --calib-data calibration_cache/1.7b_gptq_init.pkl \
+    --calib-data calibration_cache/1.7b_gptq_init.npz \
     --decoders decoder_init
 mv output/qwen3-asr-1.7b/config.json.bak output/qwen3-asr-1.7b/config.json
 
@@ -232,7 +232,7 @@ uv run python validate.py \
 uv run python collect_gptq_calib.py \
     --model output/qwen3-asr-1.7b \
     --n-samples 32 --decoder-steps 8 \
-    --output calibration_cache/1.7b_gptq_init.pkl \
+    --output calibration_cache/1.7b_gptq_init.npz \
     --target decoder_init
 
 # GPTQ decoder_init (hide config.json to bypass AutoConfig failure on qwen3_asr type)
@@ -241,7 +241,7 @@ uv run python quantize_nbits.py \
     --input output/qwen3-asr-1.7b \
     --output output/qwen3-asr-1.7b-int4 \
     --bits 4 --block-size 64 --algo gptq \
-    --calib-data calibration_cache/1.7b_gptq_init.pkl \
+    --calib-data calibration_cache/1.7b_gptq_init.npz \
     --decoders decoder_init
 mv output/qwen3-asr-1.7b/config.json.bak output/qwen3-asr-1.7b/config.json
 # Clean up GPTQ temp files in source dir

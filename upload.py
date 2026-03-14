@@ -95,9 +95,7 @@ MODEL_CARD_FOOTER = """\
 
 ## Weight Sharing
 
-FP32 and INT8 decoders use a split architecture where `decoder_init` and `decoder_step`
-share a single external weights file (`decoder_weights.data` / `decoder_weights.int8.data`),
-eliminating duplicate weight storage. int4 decoders have separate data files per model.
+{weight_sharing_detail}
 
 ## Mel Spectrogram Parameters
 
@@ -173,11 +171,32 @@ def build_model_card(input_dir, base_model, model_name, embed_dtype, vocab_size,
         card += INT8_SECTION
     if has_int4:
         card += INT4_SECTION
+    if has_int8 and has_int4:
+        weight_sharing_detail = (
+            "FP32 and INT8 decoders share a single external weights file each "
+            "(`decoder_weights.data` / `decoder_weights.int8.data`), eliminating "
+            "duplicate weight storage. int4 decoders have separate data files per model."
+        )
+    elif has_int8:
+        weight_sharing_detail = (
+            "FP32 and INT8 decoders each use a split architecture where `decoder_init` "
+            "and `decoder_step` share a single external weights file "
+            "(`decoder_weights.data` / `decoder_weights.int8.data`), "
+            "eliminating duplicate weight storage."
+        )
+    else:
+        weight_sharing_detail = (
+            "FP32 decoder init and step share a single external weights file "
+            "(`decoder_weights.data`), eliminating duplicate weight storage. "
+            "int4 decoders have separate data files per model."
+        )
+
     card += MODEL_CARD_FOOTER.format(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
         embed_dtype=embed_dtype,
         tar_name=tar_name,
+        weight_sharing_detail=weight_sharing_detail,
     )
 
     variants_str = "+".join(["FP32"] + (["INT8"] if has_int8 else []) + (["int4"] if has_int4 else []))
