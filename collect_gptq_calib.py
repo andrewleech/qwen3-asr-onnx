@@ -8,36 +8,32 @@ decoder_init and decoder_step inputs for use with GPTQ quantization.
 Input data is streamed from HuggingFace LibriSpeech test-other (same source
 as evaluate_wer.py), ensuring calibration distribution matches evaluation.
 
-Output: pickle files containing lists of input dicts compatible with ORT's
-CalibrationDataReader interface.
+Output: numpy .npz files containing input dicts compatible with ORT's
+CalibrationDataReader interface (via NpzCalibrationReader in quantize_nbits.py).
 
 Usage:
-    # Collect both init and step inputs (decoder_init and decoder_step PKLs):
+    # Collect both init and step inputs (decoder_init and decoder_step .npz files):
     uv run python collect_gptq_calib.py \
         --model output/qwen3-asr-1.7b \
         --n-samples 32 \
         --decoder-steps 8 \
-        --output calibration_cache/1.7b_gptq_calib.pkl \
+        --output calibration_cache/1.7b_gptq_calib.npz \
         --target decoder_init
 
     uv run python collect_gptq_calib.py \
         --model output/qwen3-asr-1.7b \
         --n-samples 32 \
         --decoder-steps 8 \
-        --output calibration_cache/1.7b_gptq_calib_step.pkl \
+        --output calibration_cache/1.7b_gptq_calib_step.npz \
         --target decoder_step
 """
 
 import argparse
+import json
 import os
-import pickle
-import sys
 
 import numpy as np
 import onnxruntime as ort
-
-# Add src/ to path for shared modules
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_sessions(model_dir: str, threads: int) -> dict:
@@ -57,19 +53,19 @@ def load_sessions(model_dir: str, threads: int) -> dict:
 
 def load_embed(model_dir: str) -> np.ndarray:
     """Load embed_tokens.bin as float32 [vocab, hidden]."""
-    path = os.path.join(model_dir, "embed_tokens.bin")
-    data = np.fromfile(path, dtype=np.float16)
-    for hidden in [2048, 1024]:
-        if len(data) % hidden == 0:
-            return data.reshape(-1, hidden).astype(np.float32)
-    raise ValueError(f"Cannot determine embed_tokens shape from {len(data)} fp16 values")
+    config_path = os.path.join(model_dir, "config.json")
+    with open(config_path) as f:
+        cfg = json.load(f)
+    dtype_str = cfg.get("embed_tokens_dtype", "float32")
+    shape = cfg["embed_tokens_shape"]
+    dtype = np.float16 if dtype_str == "float16" else np.float32
+    embed = np.fromfile(os.path.join(model_dir, "embed_tokens.bin"), dtype=dtype).reshape(shape)
+    return embed.astype(np.float32)
 
 
 def stream_audio(n: int):
     """Yield float32 16kHz audio arrays from LibriSpeech test-other (streaming)."""
     from datasets import Audio, load_dataset
-    import soundfile as sf
-    import io as _io
     import librosa
 
     ds = load_dataset(
@@ -79,15 +75,14 @@ def stream_audio(n: int):
         streaming=True,
         trust_remote_code=True,
     )
-    ds = ds.cast_column("audio", Audio(decode=False))
+    ds = ds.cast_column("audio", Audio(decode=True))
 
     yielded = 0
     for sample in ds:
         if yielded >= n:
             break
-        raw = sample["audio"]["bytes"]
-        arr, sr = sf.read(_io.BytesIO(raw))
-        arr = arr.astype(np.float32)
+        arr = sample["audio"]["array"].astype(np.float32)
+        sr = sample["audio"]["sampling_rate"]
         if arr.ndim > 1:
             arr = arr.mean(axis=1)
         if sr != 16000:
@@ -227,10 +222,15 @@ def main():
         data = collect_step_inputs(sessions, embed_tokens, args.n_samples, args.decoder_steps)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    with open(args.output, "wb") as f:
-        pickle.dump(data, f)
-    size_mb = os.path.getsize(args.output) / 1024**2
-    print(f"\nSaved {len(data)} samples to {args.output} ({size_mb:.0f} MB)")
+    save_dict = {"_n_samples": np.array(len(data))}
+    for i, sample in enumerate(data):
+        for key, value in sample.items():
+            save_dict[f"{i}_{key}"] = value
+    np.savez(args.output, **save_dict)
+    # np.savez appends .npz if not present; resolve actual path for size reporting
+    actual_path = args.output if args.output.endswith(".npz") else args.output + ".npz"
+    size_mb = os.path.getsize(actual_path) / 1024**2
+    print(f"\nSaved {len(data)} samples to {actual_path} ({size_mb:.0f} MB)")
 
 
 if __name__ == "__main__":

@@ -23,10 +23,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# 0.6B encoder dimensions (kept for backward compat; EncoderWrapper reads from config)
-NUM_HEADS = 14
-HEAD_DIM = 64
-D_MODEL = 896
 CONV_WINDOW = 100       # n_window * 2
 TOKENS_PER_WINDOW = 13  # tokens output by conv on a full 100-frame window
 ATTN_WINDOW_SIZE = 104  # TOKENS_PER_WINDOW * (n_window_infer // conv_window) = 13 * 8
@@ -156,6 +152,7 @@ class EncoderWrapper(nn.Module):
         num_conv_windows = T_padded // CONV_WINDOW
 
         # [1, 128, T_padded] -> [N, 1, 128, CONV_WINDOW]
+        assert mel.shape[0] == 1, f"Expected batch=1, got {mel.shape[0]}"
         x = mel.squeeze(0)                                     # [128, T_padded]
         x = x.reshape(128, num_conv_windows, CONV_WINDOW)      # [128, N, 100]
         x = x.permute(1, 0, 2)                                 # [N, 128, 100]

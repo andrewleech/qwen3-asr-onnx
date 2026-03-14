@@ -9,7 +9,8 @@ The prompt structure for ASR transcription:
 Where <|audio_pad|> is repeated N times (N = encoder output sequence length).
 """
 
-# Special token IDs (from Qwen3-ASR-0.6B tokenizer_config.json)
+# Special token IDs — shared across all Qwen3-ASR model sizes; validated by
+# verify_special_tokens() in export.py at export time against the actual tokenizer.
 ENDOFTEXT_TOKEN_ID = 151643  # <|endoftext|> - pad token, also EOS
 IM_START_TOKEN_ID = 151644   # <|im_start|>
 IM_END_TOKEN_ID = 151645     # <|im_end|> - also EOS

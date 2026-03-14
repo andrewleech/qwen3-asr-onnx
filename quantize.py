@@ -45,6 +45,7 @@ def _simplify_if_needed(input_path: str) -> str:
         model_sim, ok = onnxsim.simplify(model)
         if ok:
             tmpfile = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)
+            tmpfile.close()  # Close before writing so onnx.save can open it on all platforms
             onnx.save(model_sim, tmpfile.name)
             print(f"    Simplified for shape inference compatibility")
             return tmpfile.name
@@ -83,15 +84,16 @@ def quantize_onnx_file(
     # Try direct quantization first, fall back to simplification
     tmp_path = None
     try:
-        quantize_dynamic(input_path, output_path, **quant_kwargs)
-    except Exception:
-        # Shape inference may fail on dynamo-exported models; simplify first
-        print(f"    Direct quantization failed, trying with onnxsim...")
-        tmp_path = _simplify_if_needed(input_path)
-        quantize_dynamic(tmp_path, output_path, **quant_kwargs)
-
-    if tmp_path and tmp_path != input_path:
-        os.unlink(tmp_path)
+        try:
+            quantize_dynamic(input_path, output_path, **quant_kwargs)
+        except Exception as e:
+            # Shape inference may fail on dynamo-exported models; simplify first
+            print(f"    Direct quantization failed ({e}), retrying with onnxsim")
+            tmp_path = _simplify_if_needed(input_path)
+            quantize_dynamic(tmp_path, output_path, **quant_kwargs)
+    finally:
+        if tmp_path and tmp_path != input_path:
+            os.unlink(tmp_path)
 
     in_size = _total_size(input_path)
     out_size = _total_size(output_path)

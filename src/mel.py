@@ -52,6 +52,8 @@ def log_mel_spectrogram(
     Returns:
         Tensor of shape [1, n_mels, time] (log-mel, float32)
     """
+    assert sample_rate == 16000, f"Expected 16kHz audio, got {sample_rate}Hz"
+
     if audio.dtype != np.float32:
         audio = audio.astype(np.float32)
 

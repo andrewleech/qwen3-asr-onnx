@@ -23,11 +23,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# Qwen3-0.6B decoder dimensions
+# Qwen3-0.6B decoder dimensions (kept for test compatibility; wrappers read from text_config)
 NUM_LAYERS = 28
 NUM_Q_HEADS = 16
 NUM_KV_HEADS = 8
-NUM_KV_GROUPS = NUM_Q_HEADS // NUM_KV_HEADS  # 2
 HEAD_DIM = 128
 
 
@@ -54,10 +53,10 @@ def _repeat_kv(hidden_states, n_rep):
     return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
 
-def _attention(query, key, value, mask, scaling):
+def _attention(query, key, value, mask, scaling, num_kv_groups):
     """Eager attention with GQA expansion."""
-    key = _repeat_kv(key, NUM_KV_GROUPS)
-    value = _repeat_kv(value, NUM_KV_GROUPS)
+    key = _repeat_kv(key, num_kv_groups)
+    value = _repeat_kv(value, num_kv_groups)
     attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
     if mask is not None:
         attn_weights = attn_weights + mask[:, :, :, : key.shape[-2]]
@@ -66,7 +65,7 @@ def _attention(query, key, value, mask, scaling):
     return attn_output.transpose(1, 2).contiguous()
 
 
-def _decoder_layer_forward(layer, hidden_states, cos, sin, mask, past_key, past_value):
+def _decoder_layer_forward(layer, hidden_states, cos, sin, mask, past_key, past_value, num_kv_groups):
     """
     Run a single decoder layer, returning (hidden_states, key_states, value_states).
 
@@ -105,7 +104,7 @@ def _decoder_layer_forward(layer, hidden_states, cos, sin, mask, past_key, past_
         value_states = torch.cat([past_value, value_states], dim=2)
 
     # Attention
-    attn_output = _attention(query_states, key_states, value_states, mask, attn.scaling)
+    attn_output = _attention(query_states, key_states, value_states, mask, attn.scaling, num_kv_groups)
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn.o_proj(attn_output)
 
@@ -129,12 +128,13 @@ class DecoderInitWrapper(nn.Module):
     We accept 1D position_ids and tile to 3D internally.
     """
 
-    def __init__(self, text_model, lm_head):
+    def __init__(self, text_model, lm_head, text_config):
         super().__init__()
         self.layers = text_model.layers
         self.norm = text_model.norm
         self.rotary_emb = text_model.rotary_emb
         self.lm_head = lm_head
+        self.num_kv_groups = text_config.num_attention_heads // text_config.num_key_value_heads
 
     def forward(
         self,
@@ -176,6 +176,7 @@ class DecoderInitWrapper(nn.Module):
             hidden_states, key_states, value_states = _decoder_layer_forward(
                 layer, hidden_states, cos, sin, causal_mask,
                 past_key=None, past_value=None,
+                num_kv_groups=self.num_kv_groups,
             )
             all_keys.append(key_states)
             all_values.append(value_states)
@@ -195,12 +196,13 @@ class DecoderStepWrapper(nn.Module):
     Manually iterates through layers to avoid DynamicCache.
     """
 
-    def __init__(self, text_model, lm_head):
+    def __init__(self, text_model, lm_head, text_config):
         super().__init__()
         self.layers = text_model.layers
         self.norm = text_model.norm
         self.rotary_emb = text_model.rotary_emb
         self.lm_head = lm_head
+        self.num_kv_groups = text_config.num_attention_heads // text_config.num_key_value_heads
 
     def forward(
         self,
@@ -239,6 +241,7 @@ class DecoderStepWrapper(nn.Module):
             hidden_states, key_states, value_states = _decoder_layer_forward(
                 layer, hidden_states, cos, sin, mask,
                 past_key=past_keys[i], past_value=past_values[i],
+                num_kv_groups=self.num_kv_groups,
             )
             all_keys.append(key_states)
             all_values.append(value_states)
@@ -271,7 +274,7 @@ def export_decoder_init(
 
     text_model = model.thinker.model
     lm_head = model.thinker.lm_head
-    wrapper = DecoderInitWrapper(text_model, lm_head).eval().to(device)
+    wrapper = DecoderInitWrapper(text_model, lm_head, text_config).eval().to(device)
 
     # Dummy input: 100 tokens (typical for ~8 seconds of audio + prompt tokens)
     seq_len = 100
@@ -329,7 +332,7 @@ def export_decoder_step(
 
     text_model = model.thinker.model
     lm_head = model.thinker.lm_head
-    wrapper = DecoderStepWrapper(text_model, lm_head).eval().to(device)
+    wrapper = DecoderStepWrapper(text_model, lm_head, text_config).eval().to(device)
 
     # Dummy inputs: single token + KV cache from 100-token prefill
     past_seq_len = 100

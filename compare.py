@@ -142,8 +142,9 @@ def load_onnx_sessions(onnx_dir: str) -> dict:
 
 def run_onnx(sessions, embed_tokens, audio: np.ndarray, tokenizer, label: str) -> dict:
     """Run full ONNX pipeline with split decoder (decoder_init + decoder_step)."""
+    from src.inference import greedy_decode_onnx
     from src.mel import log_mel_spectrogram
-    from src.prompt import build_prompt_ids, get_audio_pad_range, EOS_TOKEN_IDS
+    from src.prompt import build_prompt_ids, EOS_TOKEN_IDS
 
     # Mel
     mel_torch = log_mel_spectrogram(audio)
@@ -154,47 +155,12 @@ def run_onnx(sessions, embed_tokens, audio: np.ndarray, tokenizer, label: str) -
     audio_features = sessions["encoder"].run(["audio_features"], {"mel": mel_np})[0]
     enc_time = time.time() - t0
 
-    # Prompt
+    # Prompt + decode
     audio_token_count = audio_features.shape[1]
     prompt_ids = build_prompt_ids(audio_token_count)
 
-    # Build input embeddings
-    input_embeds = embed_tokens[prompt_ids]
-    audio_start, audio_end = get_audio_pad_range(prompt_ids)
-    input_embeds[audio_start:audio_end] = audio_features[0]
-    input_embeds = input_embeds[np.newaxis, :, :]
-    position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
-
-    # Prefill
     t0 = time.time()
-    logits, present_keys, present_values = sessions["decoder_init"].run(
-        ["logits", "present_keys", "present_values"],
-        {"input_embeds": input_embeds, "position_ids": position_ids},
-    )
-
-    next_token = int(np.argmax(logits[0, -1, :]))
-    tokens = [next_token]
-
-    # Autoregressive decode
-    pos = len(prompt_ids)
-    for _ in range(255):
-        if next_token in EOS_TOKEN_IDS:
-            break
-        token_embed = embed_tokens[next_token][np.newaxis, np.newaxis, :]
-        step_pos = np.array([[pos]], dtype=np.int64)
-
-        logits, present_keys, present_values = sessions["decoder_step"].run(
-            ["logits", "present_keys", "present_values"],
-            {
-                "input_embeds": token_embed,
-                "position_ids": step_pos,
-                "past_keys": present_keys,
-                "past_values": present_values,
-            },
-        )
-        next_token = int(np.argmax(logits[0, -1, :]))
-        tokens.append(next_token)
-        pos += 1
+    tokens = greedy_decode_onnx(sessions, embed_tokens, audio_features, prompt_ids, max_tokens=256)
     dec_time = time.time() - t0
 
     # Strip EOS

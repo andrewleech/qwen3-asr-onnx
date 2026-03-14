@@ -18,7 +18,7 @@ Usage (GPTQ, calibration-based):
         --bits 4 \
         --block-size 64 \
         --algo gptq \
-        --calib-data calibration_cache/1.7b_gptq_calib.pkl
+        --calib-data calibration_cache/1.7b_gptq_calib.npz
 
 Usage (accuracy_level, for testing AVX-512 VNNI paths):
     uv run python quantize_nbits.py \
@@ -34,9 +34,9 @@ The encoder and non-decoder files are copied unchanged.
 import argparse
 import json
 import os
-import pickle
 import shutil
 
+import numpy as np
 import onnx
 from onnxruntime.quantization.matmul_nbits_quantizer import (
     GPTQWeightOnlyQuantConfig,
@@ -47,12 +47,17 @@ from onnxruntime.quantization.calibrate import CalibrationDataReader
 from onnxruntime.quantization.quant_utils import QuantFormat
 
 
-class PickleCalibrationReader(CalibrationDataReader):
-    """Feeds pre-collected input dicts from a pickle file to GPTQ."""
+class NpzCalibrationReader(CalibrationDataReader):
+    """Feeds pre-collected input dicts from a numpy .npz file to GPTQ."""
 
     def __init__(self, path: str):
-        with open(path, "rb") as f:
-            self._data: list[dict] = pickle.load(f)
+        data = np.load(path)
+        n = int(data["_n_samples"])
+        self._data: list[dict] = []
+        for i in range(n):
+            prefix = f"{i}_"
+            sample_keys = [k[len(prefix):] for k in data.files if k.startswith(prefix)]
+            self._data.append({k: data[f"{prefix}{k}"] for k in sample_keys})
         self._idx = 0
 
     def get_next(self) -> dict | None:
@@ -81,7 +86,7 @@ def quantize_decoder(
     if algo == "gptq":
         if calib_data_path is None:
             raise ValueError("--calib-data required for --algo gptq")
-        reader = PickleCalibrationReader(calib_data_path)
+        reader = NpzCalibrationReader(calib_data_path)
         algo_config = GPTQWeightOnlyQuantConfig(
             calibration_data_reader=reader,
             block_size=block_size,

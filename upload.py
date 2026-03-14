@@ -192,6 +192,7 @@ def main():
     parser.add_argument("--tar", action="store_true", help="Include the .tar.gz in the upload")
     parser.add_argument("--private", action="store_true", help="Create private repo")
     parser.add_argument("--dry-run", action="store_true", help="Generate model card only, don't upload")
+    parser.add_argument("--force", action="store_true", help="Skip upload confirmation prompt")
     args = parser.parse_args()
 
     # Read config for model card fields
@@ -238,6 +239,15 @@ def main():
                 shutil.copy2(tar_path, dest)
         else:
             print(f"WARNING: --tar specified but {tar_path} not found")
+
+    # Confirm before destructive upload
+    if not args.force:
+        print(f"\nTarget repo: https://huggingface.co/{args.repo}")
+        print(f"This will replace ALL existing contents of that repo.")
+        answer = input("Proceed? [y/N] ").strip().lower()
+        if answer != "y":
+            print("Aborted.")
+            return
 
     # Upload, replacing all existing contents
     print(f"Uploading {args.input} to {args.repo}...")

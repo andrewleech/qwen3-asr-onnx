@@ -306,8 +306,9 @@ def evaluate(model_dirs: list[tuple[str, str]], dataset_keys: list[str], n_sampl
 
 def _run(sessions: dict, embed_tokens: np.ndarray, tokenizer, audio: np.ndarray) -> str:
     """Run full ONNX pipeline, return raw decoded text."""
+    from src.inference import greedy_decode_onnx
     from src.mel import log_mel_spectrogram
-    from src.prompt import build_prompt_ids, get_audio_pad_range, EOS_TOKEN_IDS
+    from src.prompt import build_prompt_ids, EOS_TOKEN_IDS
 
     mel = log_mel_spectrogram(audio)
     mel_np = mel.cpu().numpy()
@@ -319,39 +320,7 @@ def _run(sessions: dict, embed_tokens: np.ndarray, tokenizer, audio: np.ndarray)
         return ""
 
     prompt_ids = build_prompt_ids(audio_token_count)
-
-    input_embeds = embed_tokens[prompt_ids].copy()
-    audio_start, audio_end = get_audio_pad_range(prompt_ids)
-    input_embeds[audio_start:audio_end] = audio_features[0]
-    input_embeds = input_embeds[np.newaxis, :, :]
-    position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
-
-    logits, keys, values = sessions["decoder_init"].run(
-        ["logits", "present_keys", "present_values"],
-        {"input_embeds": input_embeds, "position_ids": position_ids},
-    )
-
-    next_token = int(np.argmax(logits[0, -1, :]))
-    tokens = [next_token]
-    pos = len(prompt_ids)
-
-    for _ in range(255):
-        if next_token in EOS_TOKEN_IDS:
-            break
-        step_embed = embed_tokens[next_token][np.newaxis, np.newaxis, :]
-        step_pos = np.array([[pos]], dtype=np.int64)
-        logits, keys, values = sessions["decoder_step"].run(
-            ["logits", "present_keys", "present_values"],
-            {
-                "input_embeds": step_embed,
-                "position_ids": step_pos,
-                "past_keys": keys,
-                "past_values": values,
-            },
-        )
-        next_token = int(np.argmax(logits[0, -1, :]))
-        tokens.append(next_token)
-        pos += 1
+    tokens = greedy_decode_onnx(sessions, embed_tokens, audio_features, prompt_ids, max_tokens=256)
 
     while tokens and tokens[-1] in EOS_TOKEN_IDS:
         tokens.pop()

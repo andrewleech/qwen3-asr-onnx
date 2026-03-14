@@ -20,6 +20,7 @@ import soundfile as sf
 import torch
 from transformers import AutoModel, AutoTokenizer
 
+from src.inference import greedy_decode_onnx
 from src.mel import log_mel_spectrogram
 from src.prompt import (
     build_prompt_ids,
@@ -38,7 +39,8 @@ def load_pytorch_model(model_id: str, device: str = "cpu"):
             device_map=device,
             trust_remote_code=True,
         )
-    except Exception:
+    except ValueError as e:
+        print(f"AutoModel.from_pretrained failed ({e}), falling back to direct import")
         from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
             Qwen3ASRForConditionalGeneration,
         )
@@ -98,105 +100,6 @@ def run_encoder_pytorch(model, mel: torch.Tensor) -> torch.Tensor:
     wrapper = wrapper.to(mel.device)
     with torch.no_grad():
         return wrapper(mel)
-
-
-def run_decoder_init_onnx(session, input_embeds: np.ndarray, position_ids: np.ndarray):
-    """Run decoder prefill through ONNX Runtime.
-
-    Returns:
-        (logits, present_keys, present_values)
-        Keys/values are stacked: [num_layers, batch, kv_heads, seq_len, head_dim]
-    """
-    inputs = {
-        "input_embeds": input_embeds,
-        "position_ids": position_ids,
-    }
-    logits, present_keys, present_values = session.run(
-        ["logits", "present_keys", "present_values"], inputs
-    )
-    return logits, present_keys, present_values
-
-
-def run_decoder_step_onnx(session, input_embeds: np.ndarray, position_ids: np.ndarray,
-                          past_keys: np.ndarray, past_values: np.ndarray):
-    """Run decoder step through ONNX Runtime.
-
-    Returns:
-        (logits, present_keys, present_values)
-    """
-    inputs = {
-        "input_embeds": input_embeds,
-        "position_ids": position_ids,
-        "past_keys": past_keys,
-        "past_values": past_values,
-    }
-    logits, present_keys, present_values = session.run(
-        ["logits", "present_keys", "present_values"], inputs
-    )
-    return logits, present_keys, present_values
-
-
-def greedy_decode_onnx(
-    sessions: dict,
-    embed_tokens: np.ndarray,
-    audio_features: np.ndarray,
-    prompt_ids: list[int],
-    max_tokens: int = 512,
-) -> list[int]:
-    """
-    Greedy decode using ONNX Runtime sessions.
-
-    1. Build input embeddings (text embeds + audio feature replacement)
-    2. Run decoder_init (prefill)
-    3. Loop decoder_step until EOS or max_tokens
-    """
-    # Build input embeddings
-    input_embeds = embed_tokens[prompt_ids]  # [seq_len, 1024]
-
-    # Replace audio_pad positions with audio features
-    audio_start, audio_end = get_audio_pad_range(prompt_ids)
-    audio_len = audio_end - audio_start
-    if audio_features.shape[1] != audio_len:
-        raise ValueError(
-            f"Audio feature length {audio_features.shape[1]} != "
-            f"audio_pad count {audio_len}"
-        )
-    input_embeds[audio_start:audio_end] = audio_features[0]  # [audio_len, 1024]
-
-    # Add batch dimension
-    input_embeds = input_embeds[np.newaxis, :, :]  # [1, seq_len, 1024]
-    position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]  # [1, seq_len]
-
-    # Prefill
-    logits, present_keys, present_values = run_decoder_init_onnx(
-        sessions["decoder_init"], input_embeds, position_ids
-    )
-
-    # First token from prefill logits
-    next_token = int(np.argmax(logits[0, -1, :]))
-    output_tokens = [next_token]
-
-    if next_token in EOS_TOKEN_IDS:
-        return output_tokens
-
-    # Autoregressive loop
-    pos = len(prompt_ids)
-    for _ in range(max_tokens - 1):
-        token_embed = embed_tokens[next_token][np.newaxis, np.newaxis, :]  # [1, 1, 1024]
-        step_pos = np.array([[pos]], dtype=np.int64)
-
-        logits, present_keys, present_values = run_decoder_step_onnx(
-            sessions["decoder_step"], token_embed, step_pos, present_keys, present_values
-        )
-
-        next_token = int(np.argmax(logits[0, -1, :]))
-        output_tokens.append(next_token)
-        pos += 1
-
-        if next_token in EOS_TOKEN_IDS:
-            break
-
-    return output_tokens
 
 
 def greedy_decode_pytorch(

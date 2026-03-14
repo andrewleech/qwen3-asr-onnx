@@ -152,6 +152,10 @@ def package(fp32_dir, int8_dir, output_dir, create_tar, int4_dir=None, test_wavs
     """Package FP32 + INT8 into a combined release directory."""
 
     if os.path.exists(output_dir):
+        source_dirs = {d for d in [fp32_dir, int8_dir, int4_dir] if d is not None}
+        assert os.path.realpath(output_dir) not in {os.path.realpath(d) for d in source_dirs}, (
+            f"output_dir {output_dir!r} must not be the same as a source directory"
+        )
         print(f"Removing existing output: {output_dir}")
         shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)

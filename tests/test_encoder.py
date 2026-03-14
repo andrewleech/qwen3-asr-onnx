@@ -31,7 +31,8 @@ def pytorch_model():
             device_map="cpu",
             trust_remote_code=True,
         )
-    except Exception:
+    except ValueError as e:
+        print(f"AutoModel.from_pretrained failed ({e}), falling back to direct import")
         from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
             Qwen3ASRForConditionalGeneration,
         )

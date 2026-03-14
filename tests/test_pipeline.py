@@ -18,6 +18,7 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from src.encoder_wrapper import EncoderWrapper
+from src.inference import greedy_decode_onnx
 from src.mel import log_mel_spectrogram
 from src.prompt import build_prompt_ids, get_audio_pad_range, EOS_TOKEN_IDS
 
@@ -94,55 +95,6 @@ def embed_tokens():
         os.path.join(OUTPUT_DIR, "embed_tokens.bin"),
         dtype=np.float32,
     ).reshape(shape)
-
-
-def decode_onnx(sessions, embed_tokens, audio_features, prompt_ids, max_tokens=256):
-    """Greedy decode using ONNX sessions."""
-    input_embeds = embed_tokens[prompt_ids].copy()
-
-    audio_start, audio_end = get_audio_pad_range(prompt_ids)
-    input_embeds[audio_start:audio_end] = audio_features[0]
-
-    input_embeds = input_embeds[np.newaxis, :, :]
-    position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
-
-    # Prefill
-    output_names = [o.name for o in sessions["decoder_init"].get_outputs()]
-    results = sessions["decoder_init"].run(
-        output_names,
-        {"input_embeds": input_embeds, "position_ids": position_ids},
-    )
-
-    logits = results[0]
-    kv_cache = {name: results[i] for i, name in enumerate(output_names) if i > 0}
-
-    next_token = int(np.argmax(logits[0, -1, :]))
-    tokens = [next_token]
-
-    # Autoregressive
-    pos = len(prompt_ids)
-    for _ in range(max_tokens - 1):
-        if next_token in EOS_TOKEN_IDS:
-            break
-
-        step_embeds = embed_tokens[next_token][np.newaxis, np.newaxis, :]
-        step_pos = np.array([[pos]], dtype=np.int64)
-
-        step_inputs = {"input_embeds": step_embeds, "position_ids": step_pos}
-        for name, value in kv_cache.items():
-            step_inputs[name.replace("present_", "past_")] = value
-
-        step_names = [o.name for o in sessions["decoder_step"].get_outputs()]
-        step_results = sessions["decoder_step"].run(step_names, step_inputs)
-
-        logits = step_results[0]
-        kv_cache = {name: step_results[i] for i, name in enumerate(step_names) if i > 0}
-
-        next_token = int(np.argmax(logits[0, -1, :]))
-        tokens.append(next_token)
-        pos += 1
-
-    return tokens
 
 
 def decode_pytorch(model, audio_features, prompt_ids, max_tokens=256):
@@ -231,7 +183,7 @@ class TestPipeline:
 
         # Decode both
         pt_tokens = decode_pytorch(pytorch_model, pt_features, prompt_ids)
-        onnx_tokens = decode_onnx(onnx_sessions, embed_tokens, onnx_features, prompt_ids)
+        onnx_tokens = greedy_decode_onnx(onnx_sessions, embed_tokens, onnx_features, prompt_ids)
 
         pt_text = tokenizer.decode(pt_tokens, skip_special_tokens=True)
         onnx_text = tokenizer.decode(onnx_tokens, skip_special_tokens=True)
@@ -259,7 +211,7 @@ class TestPipeline:
         audio_token_count = features.shape[1]
         prompt_ids = build_prompt_ids(audio_token_count)
 
-        tokens_1 = decode_onnx(onnx_sessions, embed_tokens, features, prompt_ids)
-        tokens_2 = decode_onnx(onnx_sessions, embed_tokens, features, prompt_ids)
+        tokens_1 = greedy_decode_onnx(onnx_sessions, embed_tokens, features, prompt_ids)
+        tokens_2 = greedy_decode_onnx(onnx_sessions, embed_tokens, features, prompt_ids)
 
         assert tokens_1 == tokens_2, "Greedy decode not deterministic"
