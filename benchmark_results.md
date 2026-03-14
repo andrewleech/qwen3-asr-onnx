@@ -50,15 +50,30 @@ Parakeet gets "vertebral column" correct. Both Qwen3 variants produce "vertible"
 | Engine | WER |
 |---|---|
 | Qwen3-ASR 1.7B FP32 | 3.79% |
+| Qwen3-ASR 1.7B int4 GPTQ+RTN al4 | 4.25% |
 | Qwen3-ASR 0.6B FP32 | 4.42% |
+| Qwen3-ASR 0.6B int4 RTN al4 | 5.08% |
+| Qwen3-ASR 0.6B AWQ INT8 α=0.2 | 5.21% |
 | Parakeet-TDT 0.6B INT8 | 5.45% |
-| Qwen3-ASR 0.6B Smooth INT8 | 5.62% |
+| Qwen3-ASR 0.6B AWQ INT8 α=0.5 | 5.62% |
 | Qwen3-ASR 0.6B Naive INT8 | 6.75% |
+| Qwen3-ASR 1.7B AWQ INT8 α=0.2 | 9.04% |
+
+## JFK RTF Results (1.7B, 2026-03-14)
+
+| Engine | RTF (11s) | RTF (35s) |
+|---|---|---|
+| Qwen3-ASR 1.7B FP32 | ~0.70x | ~0.70x |
+| Qwen3-ASR 1.7B int4 GPTQ+RTN al4 | 0.34x | — |
+| Qwen3-ASR 1.7B int4 RTN (block_size=64) | 0.56x | 0.65x |
 
 ## Combined Summary
 
-| Engine | WER | RTF (11s) | RTF (35s) | Load |
+| Engine | WER | RTF (11s) | RTF (35s) | vs Parakeet |
 |---|---|---|---|---|
-| Qwen3-ASR 0.6B FP32 | 4.42% | 0.29x | 0.32x | 17.0s |
-| Qwen3-ASR 0.6B Smooth INT8 | 5.62% | 0.14x | 0.17x | 4.9s |
-| Parakeet-TDT 0.6B INT8 | 5.45% | 0.16x | 0.13x | 1.2s |
+| Qwen3-ASR 1.7B FP32 | 3.79% | ~0.70x | ~0.70x | 4.4× slower |
+| Qwen3-ASR 1.7B int4 GPTQ+RTN al4 | 4.25% | 0.34x | — | 2.1× slower |
+| Qwen3-ASR 0.6B FP32 | 4.42% | 0.29x | 0.32x | 1.8× slower |
+| Qwen3-ASR 0.6B AWQ INT8 α=0.2 | 5.21% | 0.14x | 0.17x | 1.1× faster |
+| Parakeet-TDT 0.6B INT8 | 5.45% | 0.16x | 0.13x | baseline |
+| Qwen3-ASR 0.6B AWQ INT8 α=0.5 | 5.62% | 0.14x | 0.17x | 1.1× faster |

@@ -1,15 +1,32 @@
 """
 quantize_nbits.py — Apply MatMulNBits (int4 or int8) block quantization to Qwen3-ASR decoder.
 
-Uses ORT's built-in MatMulNBitsQuantizer with RTN algorithm (no calibration data needed).
+Uses ORT's MatMulNBitsQuantizer with RTN (default) or GPTQ algorithm.
 Produces a MatMulNBits ONNX graph — weights are stored as packed uint8 with per-group scales.
 
-Usage:
+Usage (RTN, default):
     uv run python quantize_nbits.py \
         --input output/qwen3-asr-1.7b \
         --output output/trial-1.7b-int4-nbits \
         --bits 4 \
         --block-size 64
+
+Usage (GPTQ, calibration-based):
+    uv run python quantize_nbits.py \
+        --input output/qwen3-asr-1.7b \
+        --output output/trial-1.7b-gptq-int4 \
+        --bits 4 \
+        --block-size 64 \
+        --algo gptq \
+        --calib-data calibration_cache/1.7b_gptq_calib.pkl
+
+Usage (accuracy_level, for testing AVX-512 VNNI paths):
+    uv run python quantize_nbits.py \
+        --input output/qwen3-asr-0.6b \
+        --output output/trial-0.6b-int4-al1 \
+        --bits 4 \
+        --block-size 64 \
+        --accuracy-level 1
 
 The encoder and non-decoder files are copied unchanged.
 """
@@ -17,29 +34,72 @@ The encoder and non-decoder files are copied unchanged.
 import argparse
 import json
 import os
+import pickle
 import shutil
-import tempfile
 
-import numpy as np
 import onnx
-from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
-from onnxruntime.quantization.matmul_nbits_quantizer import RTNWeightOnlyQuantConfig
+from onnxruntime.quantization.matmul_nbits_quantizer import (
+    GPTQWeightOnlyQuantConfig,
+    MatMulNBitsQuantizer,
+    RTNWeightOnlyQuantConfig,
+)
+from onnxruntime.quantization.calibrate import CalibrationDataReader
 from onnxruntime.quantization.quant_utils import QuantFormat
 
 
-def quantize_decoder(input_path: str, output_path: str, bits: int, block_size: int) -> None:
-    """Quantize a single decoder ONNX file with MatMulNBits RTN."""
-    print(f"  Loading {os.path.basename(input_path)} ...")
-    model = onnx.load(input_path)
+class PickleCalibrationReader(CalibrationDataReader):
+    """Feeds pre-collected input dicts from a pickle file to GPTQ."""
 
-    algo = RTNWeightOnlyQuantConfig(quant_format=QuantFormat.QOperator)
+    def __init__(self, path: str):
+        with open(path, "rb") as f:
+            self._data: list[dict] = pickle.load(f)
+        self._idx = 0
+
+    def get_next(self) -> dict | None:
+        if self._idx >= len(self._data):
+            return None
+        item = self._data[self._idx]
+        self._idx += 1
+        return item
+
+    def __len__(self):
+        return len(self._data)
+
+
+def quantize_decoder(
+    input_path: str,
+    output_path: str,
+    bits: int,
+    block_size: int,
+    accuracy_level: int | None,
+    algo: str,
+    calib_data_path: str | None,
+) -> None:
+    """Quantize a single decoder ONNX file with MatMulNBits."""
+    print(f"  Loading {os.path.basename(input_path)} ...")
+
+    if algo == "gptq":
+        if calib_data_path is None:
+            raise ValueError("--calib-data required for --algo gptq")
+        reader = PickleCalibrationReader(calib_data_path)
+        algo_config = GPTQWeightOnlyQuantConfig(
+            calibration_data_reader=reader,
+            block_size=block_size,
+            quant_format=QuantFormat.QOperator,
+        )
+        # GPTQ requires model_path to be set — pass file path, not ModelProto
+        model_arg = input_path
+    else:
+        algo_config = RTNWeightOnlyQuantConfig(quant_format=QuantFormat.QOperator)
+        model_arg = onnx.load(input_path)
 
     quantizer = MatMulNBitsQuantizer(
-        model=model,
+        model=model_arg,
         bits=bits,
         block_size=block_size,
         is_symmetric=False,
-        algo_config=algo,
+        accuracy_level=accuracy_level,
+        algo_config=algo_config,
     )
     quantizer.process()
 
@@ -54,6 +114,24 @@ def main():
     parser.add_argument("--output", required=True, help="Output model directory")
     parser.add_argument("--bits", type=int, default=4, choices=[4, 8], help="Quantization bits")
     parser.add_argument("--block-size", type=int, default=64, help="Block size (group size)")
+    parser.add_argument(
+        "--accuracy-level",
+        type=int,
+        default=None,
+        choices=[0, 1, 2, 3, 4],
+        help="MatMulNBits accuracy level (0=default fp32 accum; 1-4 may use VNNI/AVX-512 paths)",
+    )
+    parser.add_argument(
+        "--algo",
+        default="rtn",
+        choices=["rtn", "gptq"],
+        help="Quantization algorithm: rtn (no calibration) or gptq (requires --calib-data)",
+    )
+    parser.add_argument(
+        "--calib-data",
+        default=None,
+        help="Path to pickle file with calibration inputs (required for --algo gptq)",
+    )
     parser.add_argument(
         "--decoders",
         nargs="+",
@@ -71,7 +149,7 @@ def main():
             print(f"  Skipping {name}.onnx (not found)")
             continue
         dst = os.path.join(args.output, f"{name}.onnx")
-        quantize_decoder(src, dst, args.bits, args.block_size)
+        quantize_decoder(src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data)
 
     # Copy everything else unchanged
     skip_exts = {".onnx", ".data"}
@@ -94,10 +172,11 @@ def main():
     if os.path.exists(config_path):
         with open(config_path) as f:
             cfg = json.load(f)
-        cfg["quantization"] = f"int{args.bits}_nbits_block{args.block_size}"
+        al_tag = f"_al{args.accuracy_level}" if args.accuracy_level is not None else ""
+        cfg["quantization"] = f"int{args.bits}_nbits_{args.algo}_block{args.block_size}{al_tag}"
         with open(config_path, "w") as f:
             json.dump(cfg, f, indent=2)
-        print(f"  Updated config.json: quantization=int{args.bits}_nbits_block{args.block_size}")
+        print(f"  Updated config.json: quantization={cfg['quantization']}")
 
     # Report sizes
     in_mb = sum(

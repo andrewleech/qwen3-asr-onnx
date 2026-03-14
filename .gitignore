@@ -1,4 +1,5 @@
 output/
+calibration_cache/
 __pycache__/
 *.onnx
 *.onnx.data
