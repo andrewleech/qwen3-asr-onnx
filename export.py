@@ -4,10 +4,9 @@ Export Qwen3-ASR to ONNX format.
 
 Produces:
     encoder.onnx         - Audio encoder (mel -> features), weights embedded in proto
-    decoder_init.onnx    - Decoder prefill (embeddings -> logits + KV cache)
-    decoder_step.onnx    - Decoder step (token + KV cache -> logits + KV cache)
-    decoder_weights.data - Shared external weights for both decoder models
-    embed_tokens.bin     - Token embedding matrix [vocab_size, hidden_size] as raw float32
+    decoder_init.onnx    - Decoder prefill (input_ids + audio -> logits + KV cache)
+    decoder_step.onnx    - Decoder step (token ID + KV cache -> logits + KV cache)
+    decoder_weights.data - Shared external weights for both decoder models (includes embedding table)
     tokenizer.json       - HuggingFace tokenizer
     config.json          - Architecture config + special tokens + mel params
 
@@ -21,7 +20,6 @@ import json
 import os
 import shutil
 
-import numpy as np
 import torch
 from transformers import AutoModel, AutoTokenizer
 
@@ -76,25 +74,6 @@ def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
     print(f"Model loaded. Device: {device}, dtype: {dtype}")
     return model
 
-
-def extract_embed_tokens(model, output_dir: str):
-    """
-    Save the token embedding matrix as raw float32 bytes.
-
-    Shape: [vocab_size, hidden_size] (e.g. [151936, 1024] for 0.6B, [151936, 2048] for 1.7B)
-    Format: row-major float32, suitable for memory-mapped loading in Rust.
-    """
-    embed_weight = model.thinker.model.embed_tokens.weight.data
-    print(f"Embedding matrix shape: {embed_weight.shape}, dtype: {embed_weight.dtype}")
-
-    # Convert to float32 if needed (model may be loaded in bfloat16)
-    embed_np = embed_weight.cpu().float().numpy()
-
-    output_path = os.path.join(output_dir, "embed_tokens.bin")
-    embed_np.tofile(output_path)
-    print(f"Embedding matrix saved to {output_path} ({embed_np.nbytes / 1e6:.1f} MB)")
-
-    return embed_np.shape
 
 
 def copy_tokenizer(model_id: str, output_dir: str):
@@ -186,7 +165,7 @@ def write_preprocessor_config(output_dir: str):
     print(f"Preprocessor config saved to {output_path}")
 
 
-def write_config(model, output_dir: str, embed_shape: tuple):
+def write_config(model, output_dir: str):
     """
     Write config.json with architecture parameters, special tokens, and mel params.
 
@@ -243,8 +222,6 @@ def write_config(model, output_dir: str, embed_shape: tuple):
             "audio_pad_token_id": AUDIO_PAD_TOKEN_ID,
             "asr_text_token_id": ASR_TEXT_TOKEN_ID,
         },
-        "embed_tokens_shape": list(embed_shape),
-        "embed_tokens_dtype": "float32",
     }
 
     output_path = os.path.join(output_dir, "config.json")
@@ -358,17 +335,13 @@ def main():
             print("\n=== Sharing decoder weights ===")
             share_external_models(args.output)
 
-    # Extract embedding matrix
-    print("\n=== Extracting embedding matrix ===")
-    embed_shape = extract_embed_tokens(model, args.output)
-
     # Copy tokenizer
     print("\n=== Copying tokenizer ===")
     copy_tokenizer(args.model, args.output)
 
     # Write config
     print("\n=== Writing config ===")
-    write_config(model, args.output, embed_shape)
+    write_config(model, args.output)
     write_preprocessor_config(args.output)
 
     print(f"\nExport complete. Output directory: {args.output}")

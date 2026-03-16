@@ -3,7 +3,8 @@
 INT8 dynamic quantization for Qwen3-ASR ONNX models.
 
 Quantizes encoder and decoder ONNX files using onnxruntime dynamic quantization.
-Also converts embed_tokens.bin to float16 (if source is float32).
+Embedding table is part of the ONNX graph (Gather op) and is not affected by
+dynamic quantization, which only targets MatMul ops.
 
 Usage:
     python quantize.py --input output/qwen3-asr-0.6b --output output/qwen3-asr-0.6b-int8
@@ -15,7 +16,6 @@ import os
 import shutil
 import tempfile
 
-import numpy as np
 import onnx
 from onnxruntime.quantization import quantize_dynamic, QuantType
 
@@ -104,33 +104,6 @@ def quantize_onnx_file(
     )
 
 
-def quantize_embeddings(input_dir: str, output_dir: str):
-    """Convert embed_tokens.bin to float16 (or copy if already float16)."""
-    input_path = os.path.join(input_dir, "embed_tokens.bin")
-    output_path = os.path.join(output_dir, "embed_tokens.bin")
-
-    config_path = os.path.join(input_dir, "config.json")
-    with open(config_path) as f:
-        config = json.load(f)
-
-    source_dtype = config.get("embed_tokens_dtype", "float32")
-    shape = config["embed_tokens_shape"]
-
-    if source_dtype == "float16":
-        print("  embed_tokens.bin already float16, copying...")
-        shutil.copy2(input_path, output_path)
-    else:
-        print("  Converting embed_tokens.bin to float16...")
-        embed = np.fromfile(input_path, dtype=np.float32).reshape(shape)
-        embed_fp16 = embed.astype(np.float16)
-        embed_fp16.tofile(output_path)
-
-    input_size = os.path.getsize(input_path)
-    output_size = os.path.getsize(output_path)
-    print(f"    {input_size / 1e6:.1f} MB -> {output_size / 1e6:.1f} MB")
-
-    return shape
-
 
 def main():
     parser = argparse.ArgumentParser(description="Quantize ONNX models to INT8")
@@ -202,10 +175,6 @@ def main():
         print("\nSharing quantized decoder weights...")
         share_external_models(args.output)
 
-    # Quantize embeddings
-    print("\nQuantizing embeddings...")
-    shape = quantize_embeddings(args.input, args.output)
-
     # Copy non-quantized files
     print("\nCopying config and tokenizer...")
     for filename in ["tokenizer.json", "tokenizer_config.json", "added_tokens.json", "vocab.json"]:
@@ -214,11 +183,10 @@ def main():
             shutil.copy2(src, os.path.join(args.output, filename))
             print(f"  Copied {filename}")
 
-    # Write updated config with fp16 dtype
+    # Write updated config with quantization metadata
     config_path = os.path.join(args.input, "config.json")
     with open(config_path) as f:
         config = json.load(f)
-    config["embed_tokens_dtype"] = "float16"
     config["quantization"] = "int8_dynamic"
 
     output_config = os.path.join(args.output, "config.json")
