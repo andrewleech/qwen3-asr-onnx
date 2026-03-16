@@ -383,20 +383,32 @@ def main():
             opset_version=args.opset,
             device=args.device,
         )
+        # FP16 conversion must happen BEFORE inlining decoder_step (the FP32
+        # inlined proto exceeds the 2 GB protobuf limit that the ORT optimizer
+        # needs to parse). After FP16 conversion, weights are ~half size.
+        if args.dtype == "fp16":
+            print("\n=== Converting decoders to FP16 ===")
+            _convert_to_fp16(args.output, ["decoder_init.onnx", "decoder_step.onnx"])
+
         # Inline decoder_step weights into its .onnx proto. decoder_step has no
-        # embedding table (~596 MB INT8), well under the 2 GB protobuf limit.
-        # This avoids memory-mapping a large shared external data file and keeps
-        # the step session working set minimal for the hot decode loop.
+        # embedding table, so it's well under the 2 GB protobuf limit (~596 MB
+        # INT8 / ~1.2 GB FP16 / ~2.4 GB FP32). FP32 exceeds the limit and stays
+        # as external data.
         step_path = os.path.join(args.output, "decoder_step.onnx")
         step_data = step_path + ".data"
         if os.path.exists(step_data):
-            print("  Inlining decoder_step weights into .onnx proto...")
             step_model = onnx.load(step_path, load_external_data=True)
-            onnx.save(step_model, step_path)
-            os.remove(step_data)
-            print(f"  decoder_step.onnx: {os.path.getsize(step_path) / 1e6:.1f} MB (self-contained)")
+            proto_size = sum(len(t.raw_data) for t in step_model.graph.initializer)
+            if proto_size < 1_800_000_000:  # ~1.8 GB safety margin for protobuf
+                print("  Inlining decoder_step weights into .onnx proto...")
+                onnx.save(step_model, step_path)
+                os.remove(step_data)
+                print(f"  decoder_step.onnx: {os.path.getsize(step_path) / 1e6:.1f} MB (self-contained)")
+            else:
+                print(f"  decoder_step too large to inline ({proto_size / 1e6:.0f} MB), keeping external data")
+                del step_model
 
-        # decoder_init keeps external data (may exceed 2 GB with embedding table).
+        # decoder_init keeps external data (exceeds 2 GB with embedding table).
         # Rename its .data file for clarity.
         init_path = os.path.join(args.output, "decoder_init.onnx")
         init_data = init_path + ".data"
@@ -404,10 +416,6 @@ def main():
             final_data = os.path.join(args.output, "decoder_init.onnx.data")
             if init_data != final_data:
                 os.rename(init_data, final_data)
-
-        if args.dtype == "fp16":
-            print("\n=== Converting decoders to FP16 ===")
-            _convert_to_fp16(args.output, ["decoder_init.onnx", "decoder_step.onnx"])
 
     # Save embedding cache for fast Rust-side lookup in the decode step loop.
     if not args.skip_decoder:
