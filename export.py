@@ -230,18 +230,16 @@ def write_config(model, output_dir: str):
     print(f"Config saved to {output_path}")
 
 
+
 def _convert_to_fp16(output_dir: str, filenames: list[str]):
-    """Convert FP32 weight tensors to FP16 in specified ONNX files.
+    """Convert FP32 ONNX files to FP16 using ORT's graph optimizer.
 
-    Converts initializer tensors in-place from float32 to float16.
-    Model I/O types and graph ops are unchanged — ORT performs FP16→FP32
-    casts at runtime as needed. This halves weight storage on disk.
-
-    Must be called before share_external_models() for decoder files,
-    since conversion rewrites external data.
+    Uses onnxruntime.transformers.optimizer which correctly inserts Cast nodes
+    for mixed-precision ops (RMSNorm, softmax, etc.) and converts weights to
+    FP16. I/O types are kept as FP32 (keep_io_types=True) so callers don't
+    need to change tensor types.
     """
-    import numpy as np
-    from onnx import TensorProto, numpy_helper
+    from onnxruntime.transformers.optimizer import optimize_model
 
     for filename in filenames:
         path = os.path.join(output_dir, filename)
@@ -249,35 +247,19 @@ def _convert_to_fp16(output_dir: str, filenames: list[str]):
             print(f"  Skipping {filename} (not found)")
             continue
 
-        data_path = path + ".data"
         size_before = os.path.getsize(path)
+        data_path = path + ".data"
         if os.path.exists(data_path):
             size_before += os.path.getsize(data_path)
 
-        print(f"  Converting {filename} weights to FP16...")
-        model = onnx.load(path, load_external_data=True)
-
-        converted = 0
-        for tensor in model.graph.initializer:
-            if tensor.data_type == TensorProto.FLOAT:
-                arr = numpy_helper.to_array(tensor)
-                arr_fp16 = arr.astype(np.float16)
-                new_tensor = numpy_helper.from_array(arr_fp16, tensor.name)
-                tensor.CopyFrom(new_tensor)
-                converted += 1
-
-        print(f"    Converted {converted} tensors to FP16")
+        print(f"  Converting {filename} to FP16...")
+        m = optimize_model(path, model_type='gpt2', opt_level=0)
+        m.convert_float_to_float16(keep_io_types=True)
 
         # Remove old external data before saving
         if os.path.exists(data_path):
             os.remove(data_path)
-
-        # Save with external data (decoder weights can exceed 2 GB protobuf limit)
-        onnx.save_model(model, path,
-                        save_as_external_data=True,
-                        all_tensors_to_one_file=True,
-                        location=filename + ".data",
-                        size_threshold=1024)
+        m.save_model_to_file(path)
 
         size_after = os.path.getsize(path)
         if os.path.exists(data_path):
@@ -351,12 +333,16 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
-    # Load model in float32 for export (ONNX tracing works best with fp32)
+    # Always load in FP32 initially — encoder needs FP32 for mel spectrogram input.
     model = load_model(args.model, device=args.device, dtype=torch.float32)
 
     # Verify special token IDs
     print("\nVerifying special token IDs...")
     verify_special_tokens(args.model)
+
+    # Always load and export in FP32 for clean ONNX graphs. FP16 conversion
+    # is applied post-export by ORT's optimizer which correctly inserts Cast
+    # nodes and handles mixed-precision ops (RMSNorm, softmax).
 
     # Export encoder
     if not args.skip_encoder:
@@ -377,6 +363,10 @@ def main():
             onnx.save(enc, encoder_path)
             os.remove(encoder_data)
 
+        if args.dtype == "fp16":
+            print("\n=== Converting encoder to FP16 ===")
+            _convert_to_fp16(args.output, ["encoder.onnx"])
+
     # Export decoder (split architecture: decoder_init + decoder_step)
     if not args.skip_decoder:
         print("\n=== Exporting decoder (init) ===")
@@ -393,7 +383,6 @@ def main():
             opset_version=args.opset,
             device=args.device,
         )
-        # Convert to FP16 before weight sharing (FP16 rewrites external data)
         if args.dtype == "fp16":
             print("\n=== Converting decoders to FP16 ===")
             _convert_to_fp16(args.output, ["decoder_init.onnx", "decoder_step.onnx"])
@@ -401,11 +390,6 @@ def main():
         if not args.no_share_weights:
             print("\n=== Sharing decoder weights ===")
             share_external_models(args.output)
-
-    # Convert encoder to FP16 if requested (encoder has inline weights, no sharing needed)
-    if args.dtype == "fp16" and not args.skip_encoder:
-        print("\n=== Converting encoder to FP16 ===")
-        _convert_to_fp16(args.output, ["encoder.onnx"])
 
     # Copy tokenizer
     print("\n=== Copying tokenizer ===")

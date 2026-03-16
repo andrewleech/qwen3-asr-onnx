@@ -151,12 +151,12 @@ class DecoderInitWrapper(nn.Module):
         Args:
             input_ids: [batch, seq_len] token IDs (includes audio_pad placeholders)
             position_ids: [batch, seq_len]
-            audio_features: [batch, audio_len, hidden_size] encoder output
+            audio_features: [batch, audio_len, hidden_size] encoder output (FP32 from encoder)
             audio_offset: [1] start position of audio_pad tokens in the sequence
 
         Returns:
             (logits, present_keys, present_values):
-                logits: [batch, seq_len, vocab_size]
+                logits: [batch, seq_len, vocab_size] (FP32 for argmax compatibility)
                 present_keys: [num_layers, batch, kv_heads, seq_len, head_dim]
                 present_values: [num_layers, batch, kv_heads, seq_len, head_dim]
         """
