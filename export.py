@@ -383,13 +383,41 @@ def main():
             opset_version=args.opset,
             device=args.device,
         )
+        # Inline decoder_step weights into its .onnx proto. decoder_step has no
+        # embedding table (~596 MB INT8), well under the 2 GB protobuf limit.
+        # This avoids memory-mapping a large shared external data file and keeps
+        # the step session working set minimal for the hot decode loop.
+        step_path = os.path.join(args.output, "decoder_step.onnx")
+        step_data = step_path + ".data"
+        if os.path.exists(step_data):
+            print("  Inlining decoder_step weights into .onnx proto...")
+            step_model = onnx.load(step_path, load_external_data=True)
+            onnx.save(step_model, step_path)
+            os.remove(step_data)
+            print(f"  decoder_step.onnx: {os.path.getsize(step_path) / 1e6:.1f} MB (self-contained)")
+
+        # decoder_init keeps external data (may exceed 2 GB with embedding table).
+        # Rename its .data file for clarity.
+        init_path = os.path.join(args.output, "decoder_init.onnx")
+        init_data = init_path + ".data"
+        if os.path.exists(init_data):
+            final_data = os.path.join(args.output, "decoder_init.onnx.data")
+            if init_data != final_data:
+                os.rename(init_data, final_data)
+
         if args.dtype == "fp16":
             print("\n=== Converting decoders to FP16 ===")
             _convert_to_fp16(args.output, ["decoder_init.onnx", "decoder_step.onnx"])
 
-        if not args.no_share_weights:
-            print("\n=== Sharing decoder weights ===")
-            share_external_models(args.output)
+    # Save embedding cache for fast Rust-side lookup in the decode step loop.
+    if not args.skip_decoder:
+        print("\n=== Saving embedding cache ===")
+        embed_weight = model.thinker.model.embed_tokens.weight.data
+        import numpy as np
+        embed_np = embed_weight.cpu().float().numpy()
+        embed_path = os.path.join(args.output, "embed_tokens.bin")
+        embed_np.tofile(embed_path)
+        print(f"  {embed_np.shape} ({embed_np.nbytes / 1e6:.1f} MB)")
 
     # Copy tokenizer
     print("\n=== Copying tokenizer ===")

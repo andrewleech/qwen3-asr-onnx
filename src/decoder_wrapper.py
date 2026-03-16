@@ -208,15 +208,20 @@ class DecoderInitWrapper(nn.Module):
 
 class DecoderStepWrapper(nn.Module):
     """
-    Decoder autoregressive step: processes single token ID with KV cache.
+    Decoder autoregressive step: processes single pre-embedded token with KV cache.
 
-    Embedding lookup happens inside the graph.
+    Unlike decoder_init, this wrapper does NOT contain the embedding table.
+    The caller performs embedding lookup externally (from a cached FP32 copy of
+    the embedding matrix) and passes input_embeds directly. This keeps the
+    decoder_step session small enough to inline weights in the .onnx proto
+    (~596 MB INT8) and avoids memory-mapping a large shared external data file.
+
     Manually iterates through layers to avoid DynamicCache.
     """
 
     def __init__(self, text_model, lm_head, text_config):
         super().__init__()
-        self.embed_tokens = text_model.embed_tokens
+        # Note: no self.embed_tokens — embedding lookup is done externally
         self.layers = text_model.layers
         self.norm = text_model.norm
         self.rotary_emb = text_model.rotary_emb
@@ -225,14 +230,14 @@ class DecoderStepWrapper(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
         past_keys: torch.Tensor,
         past_values: torch.Tensor,
     ):
         """
         Args:
-            input_ids: [batch, 1] single token ID
+            input_embeds: [batch, 1, hidden_size] pre-looked-up token embedding
             position_ids: [batch, 1]
             past_keys: [num_layers, batch, kv_heads, past_seq, head_dim]
             past_values: [num_layers, batch, kv_heads, past_seq, head_dim]
@@ -243,7 +248,6 @@ class DecoderStepWrapper(nn.Module):
                 present_keys: [num_layers, batch, kv_heads, past_seq+1, head_dim]
                 present_values: [num_layers, batch, kv_heads, past_seq+1, head_dim]
         """
-        input_embeds = self.embed_tokens(input_ids)  # [B, 1, H]
 
         # Tile position_ids to 3D for MRoPE
         pos_3d = position_ids.unsqueeze(0).expand(3, -1, -1)
@@ -360,20 +364,20 @@ def export_decoder_step(
     lm_head = model.thinker.lm_head
     wrapper = DecoderStepWrapper(text_model, lm_head, text_config).eval().to(device)
 
-    # Dummy inputs: single token ID + KV cache from 100-token prefill
+    # Dummy inputs: single pre-embedded token + KV cache from 100-token prefill
     past_seq_len = 100
-    dummy_ids = torch.zeros(1, 1, device=device, dtype=torch.long)
+    dummy_embeds = torch.randn(1, 1, hidden_size, device=device, dtype=torch.float32)
     dummy_pos = torch.tensor([[past_seq_len]], device=device, dtype=torch.long)
 
     # Stacked KV cache: [num_layers, batch, kv_heads, past_seq, head_dim]
     dummy_past_keys = torch.randn(num_layers, 1, num_kv_heads, past_seq_len, head_dim, device=device, dtype=torch.float32)
     dummy_past_values = torch.randn(num_layers, 1, num_kv_heads, past_seq_len, head_dim, device=device, dtype=torch.float32)
 
-    input_names = ["input_ids", "position_ids", "past_keys", "past_values"]
+    input_names = ["input_embeds", "position_ids", "past_keys", "past_values"]
     output_names = ["logits", "present_keys", "present_values"]
 
     dynamic_axes = {
-        "input_ids": {0: "batch"},
+        "input_embeds": {0: "batch"},
         "position_ids": {0: "batch"},
         "past_keys": {1: "batch", 3: "past_seq_len"},
         "past_values": {1: "batch", 3: "past_seq_len"},
@@ -382,7 +386,7 @@ def export_decoder_step(
         "present_values": {1: "batch", 3: "total_seq_len"},
     }
 
-    args = (dummy_ids, dummy_pos, dummy_past_keys, dummy_past_values)
+    args = (dummy_embeds, dummy_pos, dummy_past_keys, dummy_past_values)
 
     with torch.no_grad():
         torch.onnx.export(

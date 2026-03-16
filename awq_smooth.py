@@ -46,7 +46,6 @@ from export import (
     load_model,
     write_config,
 )
-from share_weights import share_external_models
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
 from src.mel import log_mel_spectrogram
@@ -457,8 +456,17 @@ def main():
         device=args.device,
     )
 
-    print("\n=== Sharing decoder weights ===")
-    share_external_models(args.output)
+    # Keep decoder external data as-is for FP32 export.
+    # The FP32 decoder_step exceeds the 2 GB protobuf limit and must stay external.
+    # After INT8 quantization, the step weights shrink enough to inline.
+
+    # Save embedding cache
+    print("\n=== Saving embedding cache ===")
+    embed_weight = model.thinker.model.embed_tokens.weight.data
+    embed_np = embed_weight.cpu().float().numpy()
+    embed_path = os.path.join(args.output, "embed_tokens.bin")
+    embed_np.tofile(embed_path)
+    print(f"  {embed_np.shape} ({embed_np.nbytes / 1e6:.1f} MB)")
 
     print("\n=== Copying tokenizer ===")
     copy_tokenizer(args.model, args.output)

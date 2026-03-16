@@ -170,14 +170,28 @@ def main():
         onnx.save(enc, encoder_out)
         os.remove(encoder_data)
 
-    # Share decoder weights
-    if not args.no_share_weights:
-        print("\nSharing quantized decoder weights...")
-        share_external_models(args.output)
+    # Inline quantized decoder_step weights into .onnx proto.
+    # The INT8 decoder_step has no embedding table, so it's well under 2 GB.
+    step_out = os.path.join(args.output, "decoder_step.onnx")
+    step_data = step_out + ".data"
+    if os.path.exists(step_data):
+        print("\nInlining INT8 decoder_step weights into .onnx proto...")
+        step_model = onnx.load(step_out, load_external_data=True)
+        onnx.save(step_model, step_out)
+        os.remove(step_data)
+        print(f"  decoder_step.onnx: {os.path.getsize(step_out) / 1e6:.1f} MB (self-contained)")
+
+    # Rename decoder_init external data for clarity
+    init_out = os.path.join(args.output, "decoder_init.onnx")
+    init_data = init_out + ".data"
+    if os.path.exists(init_data):
+        final_data = os.path.join(args.output, "decoder_init.onnx.data")
+        if init_data != final_data:
+            os.rename(init_data, final_data)
 
     # Copy non-quantized files
     print("\nCopying config and tokenizer...")
-    for filename in ["tokenizer.json", "tokenizer_config.json", "added_tokens.json", "vocab.json"]:
+    for filename in ["tokenizer.json", "tokenizer_config.json", "added_tokens.json", "vocab.json", "embed_tokens.bin"]:
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(args.output, filename))
