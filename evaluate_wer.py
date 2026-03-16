@@ -126,8 +126,13 @@ def load_embed(model_dir: str) -> np.ndarray:
     config_path = os.path.join(model_dir, "config.json")
     with open(config_path) as f:
         cfg = json.load(f)
-    dtype_str = cfg.get("embed_tokens_dtype", "float32")
-    shape = cfg["embed_tokens_shape"]
+    # v2+ format: embed_tokens_shape removed, derive from decoder config
+    if "embed_tokens_shape" in cfg:
+        shape = cfg["embed_tokens_shape"]
+        dtype_str = cfg.get("embed_tokens_dtype", "float32")
+    else:
+        shape = [cfg["decoder"]["vocab_size"], cfg["decoder"]["hidden_size"]]
+        dtype_str = "float32"
     dtype = np.float16 if dtype_str == "float16" else np.float32
     embed = np.fromfile(os.path.join(model_dir, "embed_tokens.bin"), dtype=dtype).reshape(shape)
     return embed.astype(np.float32)

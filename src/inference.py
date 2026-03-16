@@ -15,9 +15,9 @@ def greedy_decode_onnx(
     """
     Greedy decode using ONNX Runtime sessions.
 
-    1. Build input embeddings (text embeds + audio feature replacement)
-    2. Run decoder_init (prefill)
-    3. Loop decoder_step until EOS or max_tokens
+    Supports both v1 (input_embeds for both init and step) and v3 (input_ids
+    for init, input_embeds for step) decoder formats. The format is detected
+    by checking decoder_init's input names.
 
     Args:
         sessions: dict with keys "decoder_init" and "decoder_step" (ORT sessions)
@@ -29,25 +29,44 @@ def greedy_decode_onnx(
     Returns:
         List of generated token IDs (including EOS if hit).
     """
-    input_embeds = embed_tokens[prompt_ids].copy()
-
-    audio_start, audio_end = get_audio_pad_range(prompt_ids)
-    audio_len = audio_end - audio_start
-    if audio_features.shape[1] != audio_len:
-        raise ValueError(
-            f"Audio feature length {audio_features.shape[1]} != "
-            f"audio_pad count {audio_len}"
-        )
-    input_embeds[audio_start:audio_end] = audio_features[0]
-
-    input_embeds = input_embeds[np.newaxis, :, :]
     position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
 
-    # Prefill
-    logits, present_keys, present_values = sessions["decoder_init"].run(
-        ["logits", "present_keys", "present_values"],
-        {"input_embeds": input_embeds, "position_ids": position_ids},
-    )
+    # Detect decoder format from input names
+    init_input_names = {inp.name for inp in sessions["decoder_init"].get_inputs()}
+
+    if "input_ids" in init_input_names:
+        # v3 format: decoder_init accepts input_ids + audio_features + audio_offset
+        audio_start, _ = get_audio_pad_range(prompt_ids)
+        input_ids = np.array(prompt_ids, dtype=np.int64)[np.newaxis, :]
+        audio_offset = np.array([audio_start], dtype=np.int64)
+
+        logits, present_keys, present_values = sessions["decoder_init"].run(
+            ["logits", "present_keys", "present_values"],
+            {
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "audio_features": audio_features,
+                "audio_offset": audio_offset,
+            },
+        )
+    else:
+        # v1 format: decoder_init accepts input_embeds
+        input_embeds = embed_tokens[prompt_ids].copy()
+
+        audio_start, audio_end = get_audio_pad_range(prompt_ids)
+        audio_len = audio_end - audio_start
+        if audio_features.shape[1] != audio_len:
+            raise ValueError(
+                f"Audio feature length {audio_features.shape[1]} != "
+                f"audio_pad count {audio_len}"
+            )
+        input_embeds[audio_start:audio_end] = audio_features[0]
+        input_embeds = input_embeds[np.newaxis, :, :]
+
+        logits, present_keys, present_values = sessions["decoder_init"].run(
+            ["logits", "present_keys", "present_values"],
+            {"input_embeds": input_embeds, "position_ids": position_ids},
+        )
 
     next_token = int(np.argmax(logits[0, -1, :]))
     output_tokens = [next_token]
@@ -55,7 +74,7 @@ def greedy_decode_onnx(
     if next_token in EOS_TOKEN_IDS:
         return output_tokens
 
-    # Autoregressive loop
+    # Autoregressive loop — decoder_step always accepts input_embeds
     pos = len(prompt_ids)
     for _ in range(max_tokens - 1):
         token_embed = embed_tokens[next_token][np.newaxis, np.newaxis, :]
