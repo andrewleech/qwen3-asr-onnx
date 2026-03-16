@@ -110,15 +110,16 @@ def collect_init_inputs(sessions, embed_tokens, n_samples, verbose=True):
             continue
 
         prompt_ids = build_prompt_ids(audio_token_count)
-        input_embeds = embed_tokens[prompt_ids].copy()
-        audio_start, audio_end = get_audio_pad_range(prompt_ids)
-        input_embeds[audio_start:audio_end] = audio_features[0]
-        input_embeds = input_embeds[np.newaxis, :, :]
+        audio_start, _ = get_audio_pad_range(prompt_ids)
+        input_ids = np.array(prompt_ids, dtype=np.int64)[np.newaxis, :]
         position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
+        audio_offset = np.array([audio_start], dtype=np.int64)
 
         inputs.append({
-            "input_embeds": input_embeds,
+            "input_ids": input_ids,
             "position_ids": position_ids,
+            "audio_features": audio_features,
+            "audio_offset": audio_offset,
         })
 
     return inputs
@@ -143,16 +144,20 @@ def collect_step_inputs(sessions, embed_tokens, n_samples, decoder_steps, verbos
             continue
 
         prompt_ids = build_prompt_ids(audio_token_count)
-        input_embeds = embed_tokens[prompt_ids].copy()
-        audio_start, audio_end = get_audio_pad_range(prompt_ids)
-        input_embeds[audio_start:audio_end] = audio_features[0]
-        input_embeds = input_embeds[np.newaxis, :, :]
+        audio_start, _ = get_audio_pad_range(prompt_ids)
+        input_ids = np.array(prompt_ids, dtype=np.int64)[np.newaxis, :]
         position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
+        audio_offset = np.array([audio_start], dtype=np.int64)
 
         # Run decoder_init to get initial KV cache
         logits, keys, values = sessions["decoder_init"].run(
             ["logits", "present_keys", "present_values"],
-            {"input_embeds": input_embeds, "position_ids": position_ids},
+            {
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "audio_features": audio_features,
+                "audio_offset": audio_offset,
+            },
         )
 
         next_token = int(np.argmax(logits[0, -1, :]))
