@@ -43,7 +43,6 @@ from datasets import Audio, load_dataset
 
 from export import (
     copy_tokenizer,
-    extract_embed_tokens,
     load_model,
     write_config,
 )
@@ -461,14 +460,11 @@ def main():
     print("\n=== Sharing decoder weights ===")
     share_external_models(args.output)
 
-    print("\n=== Extracting embedding matrix ===")
-    embed_shape = extract_embed_tokens(model, args.output)
-
     print("\n=== Copying tokenizer ===")
     copy_tokenizer(args.model, args.output)
 
     print("\n=== Writing config ===")
-    write_config(model, args.output, embed_shape)
+    write_config(model, args.output)
 
     print(f"\nExport complete. Output directory: {args.output}")
     print("Files:")
