@@ -6,19 +6,24 @@ Produces a MatMulNBits ONNX graph — weights are stored as packed uint8 with pe
 
 Usage (RTN, default):
     uv run python quantize_nbits.py \
-        --input output/qwen3-asr-1.7b \
-        --output output/trial-1.7b-int4-nbits \
+        --input output/qwen3-asr-1.7b-v3 \
+        --output output/qwen3-asr-1.7b-v3-int4 \
         --bits 4 \
         --block-size 64
 
-Usage (GPTQ, calibration-based):
+Usage (GPTQ decoder_init + RTN decoder_step, split runs):
     uv run python quantize_nbits.py \
-        --input output/qwen3-asr-1.7b \
-        --output output/trial-1.7b-gptq-int4 \
-        --bits 4 \
-        --block-size 64 \
-        --algo gptq \
-        --calib-data calibration_cache/1.7b_gptq_calib.npz
+        --input output/qwen3-asr-1.7b-v3 \
+        --output output/qwen3-asr-1.7b-v3-gptq-int4 \
+        --bits 4 --block-size 64 --accuracy-level 4 \
+        --algo gptq --calib-data calibration_cache/1.7b_v3_gptq_init.npz \
+        --decoders decoder_init
+
+    uv run python quantize_nbits.py \
+        --input output/qwen3-asr-1.7b-v3 \
+        --output output/qwen3-asr-1.7b-v3-gptq-int4 \
+        --bits 4 --block-size 64 --accuracy-level 4 \
+        --algo rtn --decoders decoder_step
 
 Usage (accuracy_level, for testing AVX-512 VNNI paths):
     uv run python quantize_nbits.py \
@@ -29,6 +34,8 @@ Usage (accuracy_level, for testing AVX-512 VNNI paths):
         --accuracy-level 1
 
 The encoder and non-decoder files are copied unchanged.
+Output decoder files are named {name}.onnx (not {name}.int4.onnx) with external
+data in {name}.onnx.data, matching standard ONNX conventions.
 """
 
 import argparse
@@ -88,7 +95,7 @@ def quantize_decoder(
     # Temporarily hide config.json during GPTQ quantization.
     model_dir = os.path.dirname(input_path)
     config_path = os.path.join(model_dir, "config.json")
-    config_hidden = os.path.join(model_dir, "config.json._hidden")
+    config_hidden = os.path.join(model_dir, f".config.json.{os.getpid()}.hidden")
     hide_config = algo == "gptq" and os.path.exists(config_path)
     if hide_config:
         os.rename(config_path, config_hidden)
@@ -126,12 +133,72 @@ def quantize_decoder(
         quantizer = MatMulNBitsQuantizer(**kwargs)
         quantizer.process()
     finally:
-        if hide_config and os.path.exists(config_hidden):
-            os.rename(config_hidden, config_path)
+        if hide_config:
+            if os.path.exists(config_hidden):
+                os.rename(config_hidden, config_path)
+            else:
+                print(f"  WARNING: {config_hidden} missing, config.json may not be restored")
+
+    # ORT's quantizer inserts MatMulNBits (com.microsoft domain) nodes but doesn't
+    # add the required opset import. Fix this for ONNX spec compliance.
+    model = quantizer.model.model
+    ms_domains = [o for o in model.opset_import if o.domain == "com.microsoft"]
+    has_ms_ops = any(n.op_type == "MatMulNBits" for n in model.graph.node)
+    if has_ms_ops and not ms_domains:
+        opset = model.opset_import.add()
+        opset.domain = "com.microsoft"
+        opset.version = 1
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     quantizer.model.save_model_to_file(output_path, use_external_data_format=True)
     print(f"  Saved to {output_path}")
+
+
+def _rename_to_standard(output_dir: str, name: str, bits_suffix: str) -> None:
+    """Rename quantized output to standard names and fix external data references.
+
+    ORT saves as {name}{bits_suffix}.onnx + {name}{bits_suffix}.onnx.data.
+    We rename to {name}.onnx + {name}.onnx.data and patch the external data
+    location entries in the protobuf.
+    """
+    suffixed_onnx = os.path.join(output_dir, f"{name}{bits_suffix}.onnx")
+    suffixed_data = suffixed_onnx + ".data"
+    std_onnx = os.path.join(output_dir, f"{name}.onnx")
+    std_data = std_onnx + ".data"
+
+    if suffixed_onnx == std_onnx:
+        return  # no rename needed (e.g. bits_suffix is empty)
+
+    if not os.path.exists(suffixed_onnx):
+        return
+
+    # Rename files
+    if os.path.exists(std_onnx):
+        os.remove(std_onnx)
+    os.rename(suffixed_onnx, std_onnx)
+
+    if os.path.exists(suffixed_data):
+        if os.path.exists(std_data):
+            os.remove(std_data)
+        os.rename(suffixed_data, std_data)
+
+    # Fix external data location references in the protobuf.
+    # Load without external data — we only need to patch the metadata, not the weights.
+    # Use SerializeToString to write just the proto without touching the .data file.
+    m = onnx.load(std_onnx, load_external_data=False)
+    expected_location = f"{name}.onnx.data"
+    changed = False
+    for t in m.graph.initializer:
+        for entry in t.external_data:
+            if entry.key == "location" and entry.value != expected_location:
+                entry.value = expected_location
+                changed = True
+    if changed:
+        with open(std_onnx, "wb") as f:
+            f.write(m.SerializeToString())
+        print(f"  Renamed to {name}.onnx (fixed external data refs)")
+    else:
+        print(f"  Renamed to {name}.onnx")
 
 
 def main():
@@ -156,7 +223,7 @@ def main():
     parser.add_argument(
         "--calib-data",
         default=None,
-        help="Path to pickle file with calibration inputs (required for --algo gptq)",
+        help="Path to .npz file with calibration inputs (required for --algo gptq)",
     )
     parser.add_argument(
         "--decoders",
@@ -170,6 +237,7 @@ def main():
 
     # Quantize each decoder file
     bits_suffix = f".int{args.bits}"
+    quantized_names = set()
     for name in args.decoders:
         src = os.path.join(args.input, f"{name}.onnx")
         if not os.path.exists(src):
@@ -177,56 +245,46 @@ def main():
             continue
         dst = os.path.join(args.output, f"{name}{bits_suffix}.onnx")
         quantize_decoder(src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data)
-        # Rename to standard names (drop .int4 suffix) and fix external data references
-        std_onnx = os.path.join(args.output, f"{name}.onnx")
-        std_data = os.path.join(args.output, f"{name}.onnx.data")
-        if dst != std_onnx:
-            if os.path.exists(std_onnx):
-                os.remove(std_onnx)
-            os.rename(dst, std_onnx)
-            data_file = dst + ".data"
-            if os.path.exists(data_file):
-                if os.path.exists(std_data):
-                    os.remove(std_data)
-                os.rename(data_file, std_data)
-            # Fix external data location references inside the ONNX proto
-            m = onnx.load(std_onnx, load_external_data=False)
-            for t in m.graph.initializer:
-                for entry in t.external_data:
-                    if entry.key == "location" and entry.value != f"{name}.onnx.data":
-                        entry.value = f"{name}.onnx.data"
-            onnx.save(m, std_onnx)
-            print(f"  Renamed to {name}.onnx (fixed external data refs)")
+        _rename_to_standard(args.output, name, bits_suffix)
+        quantized_names.add(name)
 
-    # Copy everything else unchanged
-    skip_exts = {".onnx", ".data"}
-    # Skip the FP32 source decoder files (we wrote quantized versions above)
-    skip_names = {f"{n}.onnx" for n in args.decoders} | {f"{n}.onnx.data" for n in args.decoders}
-    # Also skip any already-quantized variants of the same decoders in the source dir
-    skip_names |= {f"{n}{bits_suffix}.onnx" for n in args.decoders} | {f"{n}{bits_suffix}.onnx.data" for n in args.decoders}
+    # Copy everything else unchanged from input to output.
+    # Protect decoder .onnx/.data files that were produced by this or a prior run.
+    all_decoder_names = {"decoder_init", "decoder_step"}
+    protected = set()
+    for n in all_decoder_names:
+        protected |= {f"{n}.onnx", f"{n}.onnx.data",
+                      f"{n}{bits_suffix}.onnx", f"{n}{bits_suffix}.onnx.data"}
     for fname in os.listdir(args.input):
-        if fname in skip_names:
+        if fname in protected:
             continue
-        if any(fname.endswith(e) for e in skip_exts) and fname not in ("encoder.onnx",):
-            # Copy encoder unchanged
-            if fname != "encoder.onnx":
-                continue
+        # Skip non-encoder .onnx/.data files (e.g. leftover quantized variants in source)
+        if fname != "encoder.onnx" and any(fname.endswith(e) for e in (".onnx", ".data")):
+            continue
         src = os.path.join(args.input, fname)
         dst = os.path.join(args.output, fname)
-        if os.path.isfile(src) and not os.path.exists(dst):
+        if os.path.isfile(src):
             shutil.copy2(src, dst)
             print(f"  Copied {fname}")
 
-    # Update config.json quantization field
+    # Update config.json quantization field (merge with existing for split-decoder runs)
     config_path = os.path.join(args.output, "config.json")
-    if os.path.exists(config_path):
+    if os.path.exists(config_path) and quantized_names:
         with open(config_path) as f:
             cfg = json.load(f)
         al_tag = f"_al{args.accuracy_level}" if args.accuracy_level is not None else ""
-        cfg["quantization"] = f"int{args.bits}_nbits_{args.algo}_block{args.block_size}{al_tag}"
+        tag = f"int{args.bits}_{args.algo}_block{args.block_size}{al_tag}"
+
+        quant_info = cfg.get("quantization", {})
+        if isinstance(quant_info, str):
+            quant_info = {}  # migrate from old scalar format
+        for name in quantized_names:
+            quant_info[name] = tag
+        cfg["quantization"] = quant_info
+
         with open(config_path, "w") as f:
             json.dump(cfg, f, indent=2)
-        print(f"  Updated config.json: quantization={cfg['quantization']}")
+        print(f"  Updated config.json: quantization={json.dumps(quant_info)}")
 
     # Report sizes
     in_mb = sum(
