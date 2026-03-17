@@ -13,9 +13,10 @@ Datasets:
 Usage:
     uv run python evaluate_wer.py \\
         --models "0.6B FP32:output/qwen3-asr-0.6b" \\
-                 "0.6B INT8:output/qwen3-asr-0.6b-int8" \\
+                 "0.6B INT8:output/qwen3-asr-0.6b:int8" \\
+                 "0.6B int4:output/qwen3-asr-0.6b:int4" \\
                  "1.7B FP32:output/qwen3-asr-1.7b" \\
-                 "1.7B INT8:output/qwen3-asr-1.7b-int8" \\
+                 "1.7B int4:output/qwen3-asr-1.7b:int4" \\
         --datasets librispeech-other ami-sdm \\
         --n-samples 200
 """
@@ -106,18 +107,43 @@ def wer(references: list[str], hypotheses: list[str]) -> float:
 # ONNX inference
 # ---------------------------------------------------------------------------
 
-def load_sessions(model_dir: str) -> dict:
-    """Load encoder, decoder_init, decoder_step from a model directory."""
+def _resolve_model_path(model_dir: str, name: str, quant: str | None = None) -> str:
+    """Resolve model file with quantization suffix fallback.
+
+    Fallback chain: requested suffix → int8 (for int4) → FP32 (no suffix).
+    Matches the Rust resolve_model_path logic in transcribe-rs.
+    """
+    if quant:
+        # Try requested quantization
+        path = os.path.join(model_dir, f"{name}.{quant}.onnx")
+        if os.path.exists(path):
+            return path
+        # int4 falls back to int8
+        if quant == "int4":
+            path = os.path.join(model_dir, f"{name}.int8.onnx")
+            if os.path.exists(path):
+                return path
+    # FP32 fallback
+    path = os.path.join(model_dir, f"{name}.onnx")
+    if os.path.exists(path):
+        return path
+    raise FileNotFoundError(f"No model found for {name} (quant={quant}) in {model_dir}")
+
+
+def load_sessions(model_dir: str, quant: str | None = None) -> dict:
+    """Load encoder, decoder_init, decoder_step from a model directory.
+
+    quant: optional quantization suffix ("int4", "int8", "fp16") for suffixed files.
+    Falls back through int8 → FP32 if the requested variant isn't found.
+    """
     sessions = {}
     providers = ["CPUExecutionProvider"]
     opts = ort.SessionOptions()
     opts.log_severity_level = 3
     for name in ["encoder", "decoder_init", "decoder_step"]:
-        path = os.path.join(model_dir, f"{name}.onnx")
-        if os.path.exists(path):
-            sessions[name] = ort.InferenceSession(path, opts, providers=providers)
-        else:
-            raise FileNotFoundError(f"Missing {name}.onnx in {model_dir}")
+        path = _resolve_model_path(model_dir, name, quant)
+        print(f"    {name}: {os.path.basename(path)}")
+        sessions[name] = ort.InferenceSession(path, opts, providers=providers)
     return sessions
 
 
@@ -223,18 +249,19 @@ class ModelResult:
     pairs: dict = field(default_factory=dict)
 
 
-def evaluate(model_dirs: list[tuple[str, str]], dataset_keys: list[str], n_samples: int, output_path: str | None):
+def evaluate(model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[str], n_samples: int, output_path: str | None):
     """
     Main evaluation loop.
 
-    model_dirs: list of (name, path) pairs
+    model_dirs: list of (name, path, quant) tuples
     """
     # Load all models upfront
     print("Loading models...")
     models = []
-    for name, model_dir in model_dirs:
-        print(f"  {name}: {model_dir}")
-        sessions = load_sessions(model_dir)
+    for name, model_dir, quant in model_dirs:
+        quant_label = f" ({quant})" if quant else ""
+        print(f"  {name}: {model_dir}{quant_label}")
+        sessions = load_sessions(model_dir, quant)
         embed = load_embed(model_dir)
         tokenizer = get_tokenizer(model_dir)
         models.append((name, model_dir, sessions, embed, tokenizer))
@@ -372,11 +399,13 @@ def main():
     model_dirs = []
     for spec in args.models:
         if ":" not in spec:
-            parser.error(f"Model spec must be 'name:path', got: {spec!r}")
-        name, _, path = spec.partition(":")
+            parser.error(f"Model spec must be 'name:path[:quant]', got: {spec!r}")
+        parts = spec.split(":")
+        name, path = parts[0], parts[1]
+        quant = parts[2] if len(parts) > 2 else None
         if not os.path.isdir(path):
             parser.error(f"Model directory not found: {path}")
-        model_dirs.append((name, path))
+        model_dirs.append((name, path, quant))
 
     evaluate(model_dirs, args.datasets, args.n_samples, args.output)
 
