@@ -83,30 +83,51 @@ def quantize_decoder(
     """Quantize a single decoder ONNX file with MatMulNBits."""
     print(f"  Loading {os.path.basename(input_path)} ...")
 
-    if algo == "gptq":
-        if calib_data_path is None:
-            raise ValueError("--calib-data required for --algo gptq")
-        reader = NpzCalibrationReader(calib_data_path)
-        algo_config = GPTQWeightOnlyQuantConfig(
-            calibration_data_reader=reader,
-            block_size=block_size,
-            quant_format=QuantFormat.QOperator,
-        )
-        # GPTQ requires model_path to be set — pass file path, not ModelProto
-        model_arg = input_path
-    else:
-        algo_config = RTNWeightOnlyQuantConfig(quant_format=QuantFormat.QOperator)
-        model_arg = onnx.load(input_path)
+    # neural_compressor's ONNXModel calls AutoConfig.from_pretrained() on the parent
+    # directory when it finds a config.json. Our custom model_type causes it to fail.
+    # Temporarily hide config.json during GPTQ quantization.
+    model_dir = os.path.dirname(input_path)
+    config_path = os.path.join(model_dir, "config.json")
+    config_hidden = os.path.join(model_dir, "config.json._hidden")
+    hide_config = algo == "gptq" and os.path.exists(config_path)
+    if hide_config:
+        os.rename(config_path, config_hidden)
 
-    quantizer = MatMulNBitsQuantizer(
-        model=model_arg,
-        bits=bits,
-        block_size=block_size,
-        is_symmetric=False,
-        accuracy_level=accuracy_level,
-        algo_config=algo_config,
-    )
-    quantizer.process()
+    try:
+        if algo == "gptq":
+            if calib_data_path is None:
+                raise ValueError("--calib-data required for --algo gptq")
+            reader = NpzCalibrationReader(calib_data_path)
+            algo_config = GPTQWeightOnlyQuantConfig(
+                calibration_data_reader=reader,
+                block_size=block_size,
+                quant_format=QuantFormat.QOperator,
+            )
+            # GPTQ requires model_path to be set — pass file path, not ModelProto
+            model_arg = input_path
+        else:
+            algo_config = RTNWeightOnlyQuantConfig(quant_format=QuantFormat.QOperator)
+            model_arg = onnx.load(input_path)
+
+        # ORT >=1.23 removed the `bits` parameter (always 4-bit); older versions require it.
+        import inspect
+        sig = inspect.signature(MatMulNBitsQuantizer.__init__)
+        kwargs = dict(
+            model=model_arg,
+            block_size=block_size,
+            is_symmetric=False,
+            accuracy_level=accuracy_level,
+            algo_config=algo_config,
+        )
+        if "bits" in sig.parameters:
+            kwargs["bits"] = bits
+        elif bits != 4:
+            raise ValueError(f"This ORT version only supports 4-bit quantization, got bits={bits}")
+        quantizer = MatMulNBitsQuantizer(**kwargs)
+        quantizer.process()
+    finally:
+        if hide_config and os.path.exists(config_hidden):
+            os.rename(config_hidden, config_path)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     quantizer.model.save_model_to_file(output_path, use_external_data_format=True)
@@ -156,6 +177,26 @@ def main():
             continue
         dst = os.path.join(args.output, f"{name}{bits_suffix}.onnx")
         quantize_decoder(src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data)
+        # Rename to standard names (drop .int4 suffix) and fix external data references
+        std_onnx = os.path.join(args.output, f"{name}.onnx")
+        std_data = os.path.join(args.output, f"{name}.onnx.data")
+        if dst != std_onnx:
+            if os.path.exists(std_onnx):
+                os.remove(std_onnx)
+            os.rename(dst, std_onnx)
+            data_file = dst + ".data"
+            if os.path.exists(data_file):
+                if os.path.exists(std_data):
+                    os.remove(std_data)
+                os.rename(data_file, std_data)
+            # Fix external data location references inside the ONNX proto
+            m = onnx.load(std_onnx, load_external_data=False)
+            for t in m.graph.initializer:
+                for entry in t.external_data:
+                    if entry.key == "location" and entry.value != f"{name}.onnx.data":
+                        entry.value = f"{name}.onnx.data"
+            onnx.save(m, std_onnx)
+            print(f"  Renamed to {name}.onnx (fixed external data refs)")
 
     # Copy everything else unchanged
     skip_exts = {".onnx", ".data"}
@@ -172,7 +213,7 @@ def main():
                 continue
         src = os.path.join(args.input, fname)
         dst = os.path.join(args.output, fname)
-        if os.path.isfile(src):
+        if os.path.isfile(src) and not os.path.exists(dst):
             shutil.copy2(src, dst)
             print(f"  Copied {fname}")
 
