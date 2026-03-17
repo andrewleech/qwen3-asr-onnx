@@ -4,8 +4,8 @@ Export [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) and [Qwen3-A
 
 Pre-exported models are available on HuggingFace:
 
-- [andrewleech/qwen3-asr-0.6b-onnx](https://huggingface.co/andrewleech/qwen3-asr-0.6b-onnx) — FP32 + INT8 (AWQ α=0.2)
-- [andrewleech/qwen3-asr-1.7b-onnx](https://huggingface.co/andrewleech/qwen3-asr-1.7b-onnx) — FP32 + int4 (GPTQ+RTN al4)
+- [andrewleech/qwen3-asr-0.6b-onnx](https://huggingface.co/andrewleech/qwen3-asr-0.6b-onnx) — FP32 + int4 (recommended) + INT8 AWQ
+- [andrewleech/qwen3-asr-1.7b-onnx](https://huggingface.co/andrewleech/qwen3-asr-1.7b-onnx) — FP32 + int4 GPTQ+RTN (recommended)
 
 ## Output Files
 
@@ -25,14 +25,23 @@ Each model directory contains FP32 files plus quantized variants with suffixed n
 
 The decoder `.onnx` files are small graph protos (~2 MB each) with weights in separate `.data` files. For smaller quantized variants (e.g. 0.6B INT8 decoder_step at 571 MB), weights are inlined in the `.onnx` file. Encoder weights are always inlined.
 
-Multiple quantization variants coexist in a single directory. The consumer selects a variant at load time (e.g. `Quantization::Int4` in [transcribe-rs](https://github.com/andrewleech/transcribe-rs)), which resolves `decoder_init.int4.onnx` with automatic fallback to `decoder_init.onnx` (FP32) for files without a quantized variant (such as the encoder for int4 models).
+Multiple quantization variants coexist in a single directory. The consumer selects a variant at load time (e.g. `Quantization::Int4` in [transcribe-rs](https://github.com/andrewleech/transcribe-rs)), which resolves `decoder_init.int4.onnx` with automatic fallback to `decoder_init.onnx` (FP32) for files without a quantized variant.
 
-### Model Sizes
+### Recommended Variants
 
-| Model | FP32 | Best quantized | Quantized size |
+| Model | Variant | WER | RTF | Download |
+|---|---|---|---|---|
+| **0.6B** | int4 (RTN al4 decoders + FP16 encoder) | 5.16% | 0.15x | ~2.1 GB |
+| **1.7B** | int4 (GPTQ+RTN al4 decoders + FP16 encoder) | 4.25% | 0.37x | ~4.3 GB |
+
+The int4 variants use FP16 encoders (`encoder.int4.onnx`) for size reduction with no measurable WER impact vs FP32 encoders. INT8 encoders were tested but degrade 0.6B WER by ~1pp due to quantization of the windowed Conv2D layers.
+
+### All Variant Sizes
+
+| Model | FP32 | int4 (recommended) | INT8 AWQ |
 |---|---|---|---|
-| **0.6B** | ~5.8 GB | INT8 AWQ α=0.2 | ~2.1 GB |
-| **1.7B** | ~16 GB | int4 GPTQ+RTN al4 | ~5.2 GB |
+| **0.6B** | ~5.8 GB | ~2.1 GB | ~1.1 GB |
+| **1.7B** | ~16 GB | ~4.3 GB | n/a (9% WER) |
 
 INT8 models (0.6B) are produced via AWQ smoothing followed by dynamic quantization. AWQ smoothing collects per-channel activation statistics from calibration audio, then migrates outlier activation variance into RMSNorm and linear weights. The smoothed FP32 model is mathematically equivalent to the original (verified by token-for-token comparison).
 
@@ -51,9 +60,9 @@ int4 models (1.7B) use ORT's `MatMulNBitsQuantizer` with per-group scales (block
 
 RTF < 1.0 = faster than real-time. Lower is better for both WER and RTF.
 
-**0.6B AWQ INT8 α=0.2** is the recommended configuration: it beats Parakeet on both WER and speed at 1.1 GB model size. Qwen3 also produces full punctuation; Parakeet outputs minimal punctuation.
+**0.6B int4** is the recommended configuration: 5.16% WER at 0.15x RTF, matching Parakeet speed with lower WER and full punctuation output. Download size is ~2.1 GB. The INT8 AWQ variant (1.1 GB) trades slightly higher WER (5.52%) for smaller size.
 
-**1.7B int4 GPTQ+RTN al4** is the accuracy option: 4.25% WER at 2× the RTF of Parakeet. AWQ INT8 for 1.7B is not recommended — it causes degraded special token prediction (9% WER).
+**1.7B int4** is the accuracy option: 4.25% WER at 0.37x RTF. AWQ INT8 for 1.7B is not recommended — it causes degraded special token prediction (9% WER).
 
 ## Setup
 
@@ -109,21 +118,24 @@ python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
     --activations-cache output/qwen3-asr-0.6b-smooth/calibration_activations.npz
 ```
 
-### 4. int4 MatMulNBits Quantization (recommended for 1.7B)
+### 4. int4 MatMulNBits Quantization (recommended for both 0.6B and 1.7B)
 
-`quantize_nbits.py` applies ORT's `MatMulNBitsQuantizer` to the decoder files. The encoder is not quantized (int4 degrades encoder quality).
+`quantize_nbits.py` applies ORT's `MatMulNBitsQuantizer` to the decoder files. The encoder uses FP16 (copied from the FP16 export) — INT8 encoder degrades WER by ~1pp on 0.6B.
 
 ```bash
 # RTN (no calibration data, fast — adds .int4 files alongside FP32):
 python quantize_nbits.py \
-    --input output/qwen3-asr-1.7b \
-    --output output/qwen3-asr-1.7b \
+    --input output/qwen3-asr-0.6b \
+    --output output/qwen3-asr-0.6b \
     --bits 4 --block-size 64 --accuracy-level 4
+
+# Copy FP16 encoder as the int4 encoder (half the size, no WER impact):
+cp output/qwen3-asr-0.6b/encoder.fp16.onnx output/qwen3-asr-0.6b/encoder.int4.onnx
 ```
 
 `--accuracy-level 4` activates a higher-precision accumulation kernel in ORT that is both faster and more accurate than the default on x86.
 
-For improved load time via GPTQ calibration on decoder_init, see the next section.
+For improved load time via GPTQ calibration on decoder_init (1.7B), see the next section.
 
 ### 5. GPTQ Calibration + int4 (1.7B, best load time)
 
@@ -156,6 +168,9 @@ python quantize_nbits.py \
     --output output/qwen3-asr-1.7b \
     --bits 4 --block-size 64 --accuracy-level 4 \
     --decoders decoder_step
+
+# Copy FP16 encoder as the int4 encoder
+cp output/qwen3-asr-1.7b/encoder.fp16.onnx output/qwen3-asr-1.7b/encoder.int4.onnx
 
 # Clean up GPTQ temp files
 rm -f output/qwen3-asr-1.7b/*-*-*-*-*.data output/qwen3-asr-1.7b/*_augment.onnx
@@ -193,7 +208,7 @@ Complete sequence to produce all output variants from the upstream HuggingFace m
 
 The upstream models are downloaded automatically from HuggingFace on first use and cached in `~/.cache/huggingface/hub/`.
 
-### 0.6B (FP32 + AWQ INT8)
+### 0.6B (FP32 + int4 + AWQ INT8)
 
 ```bash
 # FP32 export (~5 min, ~4 GB RAM)
@@ -204,13 +219,22 @@ uv run python validate.py \
     --onnx-dir output/qwen3-asr-0.6b \
     --audio tests/fixtures/test_audio.wav
 
-# AWQ smooth + re-export (~25 min, ~6 GB RAM — calibration is the bottleneck)
+# FP16 encoder (used as encoder.int4.onnx — half the size, no WER impact)
+uv run python convert_fp16.py --input output/qwen3-asr-0.6b --output /tmp/fp16-enc --files encoder.onnx
+cp /tmp/fp16-enc/encoder.onnx output/qwen3-asr-0.6b/encoder.fp16.onnx
+
+# int4 RTN al4 decoders + FP16 encoder (recommended)
+uv run python quantize_nbits.py \
+    --input output/qwen3-asr-0.6b \
+    --output output/qwen3-asr-0.6b \
+    --bits 4 --block-size 64 --accuracy-level 4
+cp output/qwen3-asr-0.6b/encoder.fp16.onnx output/qwen3-asr-0.6b/encoder.int4.onnx
+
+# AWQ smooth + INT8 (optional, smaller but slightly higher WER)
 uv run python awq_smooth.py \
     --model Qwen/Qwen3-ASR-0.6B \
     --output output/qwen3-asr-0.6b-smooth \
     --alpha 0.2 --n-samples 128 --verify
-
-# Quantize smoothed model to INT8 (writes .int8 files into 0.6b dir)
 uv run python quantize.py \
     --input output/qwen3-asr-0.6b-smooth \
     --output output/qwen3-asr-0.6b
@@ -226,6 +250,9 @@ uv run python export.py --model Qwen/Qwen3-ASR-1.7B
 uv run python validate.py \
     --onnx-dir output/qwen3-asr-1.7b \
     --audio tests/fixtures/test_audio.wav
+
+# FP16 export (for encoder used by int4 variant)
+uv run python convert_fp16.py --input output/qwen3-asr-1.7b --output output/qwen3-asr-1.7b
 
 # Collect GPTQ calibration data for decoder_init (~10 min on 24-core, ~22 MB output)
 uv run python collect_gptq_calib.py \
@@ -248,6 +275,9 @@ uv run python quantize_nbits.py \
     --output output/qwen3-asr-1.7b \
     --bits 4 --block-size 64 --accuracy-level 4 \
     --decoders decoder_step
+
+# Copy FP16 encoder as the int4 encoder
+cp output/qwen3-asr-1.7b/encoder.fp16.onnx output/qwen3-asr-1.7b/encoder.int4.onnx
 
 # Clean up GPTQ temp files
 rm -f output/qwen3-asr-1.7b/*-*-*-*-*.data output/qwen3-asr-1.7b/*_augment.onnx
@@ -272,21 +302,27 @@ After full reproduction:
 ```
 output/
 ├── qwen3-asr-0.6b/              # All 0.6B variants in one directory
-│   ├── encoder.onnx              # FP32 (shared — no int4 encoder needed)
+│   ├── encoder.onnx              # FP32
+│   ├── encoder.int4.onnx         # FP16 (used by int4 variant)
 │   ├── encoder.int8.onnx         # INT8 AWQ
 │   ├── decoder_init.onnx         # FP32
 │   ├── decoder_init.onnx.data
+│   ├── decoder_init.int4.onnx    # int4 RTN al4
+│   ├── decoder_init.int4.onnx.data
 │   ├── decoder_init.int8.onnx    # INT8 AWQ
 │   ├── decoder_init.int8.onnx.data
 │   ├── decoder_step.onnx         # FP32
 │   ├── decoder_step.onnx.data
+│   ├── decoder_step.int4.onnx    # int4 RTN al4
+│   ├── decoder_step.int4.onnx.data
 │   ├── decoder_step.int8.onnx    # INT8 AWQ (inlined, no .data)
-│   ├── embed_tokens.bin
+│   ├── embed_tokens.bin          # Shared across all variants
 │   ├── config.json
 │   └── tokenizer.json
 ├── qwen3-asr-0.6b-smooth/       # AWQ intermediate (+ calibration_activations.npz)
 ├── qwen3-asr-1.7b/              # All 1.7B variants in one directory
-│   ├── encoder.onnx              # FP32 (shared)
+│   ├── encoder.onnx              # FP32
+│   ├── encoder.int4.onnx         # FP16 (used by int4 variant)
 │   ├── decoder_init.onnx         # FP32
 │   ├── decoder_init.onnx.data
 │   ├── decoder_init.int4.onnx    # int4 GPTQ
@@ -295,13 +331,13 @@ output/
 │   ├── decoder_step.onnx.data
 │   ├── decoder_step.int4.onnx    # int4 RTN al4
 │   ├── decoder_step.int4.onnx.data
-│   ├── embed_tokens.bin
+│   ├── embed_tokens.bin          # Shared across all variants
 │   ├── config.json
 │   └── tokenizer.json
 └── calibration_cache/            # GPTQ calibration data (reusable)
 ```
 
-Each model directory is self-contained and can be used directly by ONNX Runtime consumers. The `-smooth` directory is an intermediate; it can be deleted after INT8 quantization. For distribution, quantized files can be packaged separately from FP32 files while sharing the common files (encoder, tokenizer, config, embed_tokens).
+Each model directory is self-contained. For distribution, the int4 variant can be packaged as: `encoder.int4.onnx` + `decoder_init.int4.onnx*` + `decoder_step.int4.onnx*` + `embed_tokens.bin` + `config.json` + `tokenizer.json`. The FP32 and INT8 files are optional extras for users who need them.
 
 ## Architecture
 
