@@ -2,7 +2,7 @@
 
 Export [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) and [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) to ONNX format for use with ONNX Runtime.
 
-Pre-exported models are available on HuggingFace:
+Pre-exported models will be published on HuggingFace:
 
 - [andrewleech/qwen3-asr-0.6b-onnx](https://huggingface.co/andrewleech/qwen3-asr-0.6b-onnx) — FP32 + int4 (recommended) + INT8 AWQ
 - [andrewleech/qwen3-asr-1.7b-onnx](https://huggingface.co/andrewleech/qwen3-asr-1.7b-onnx) — FP32 + int4 GPTQ+RTN (recommended)
@@ -19,11 +19,13 @@ Each model directory contains FP32 files plus quantized variants with suffixed n
 | `decoder_init.{int4,int8,fp16}.onnx` + `.data` | Quantized decoder_init variants |
 | `decoder_step.onnx` + `.data` | FP32 decoder autoregressive step (single token + KV cache) |
 | `decoder_step.{int4,int8,fp16}.onnx` + `.data` | Quantized decoder_step variants (may be inlined when < 2 GB) |
-| `embed_tokens.bin` | Token embedding matrix `[vocab_size, hidden_size]` as raw float32 |
+| `embed_tokens.bin` | Token embedding matrix `[vocab_size, hidden_size]` as raw float32 (see below) |
 | `tokenizer.json` | HuggingFace tokenizer |
 | `config.json` | Architecture config + special tokens + mel params |
 
 The decoder `.onnx` files are small graph protos (~2 MB each) with weights in separate `.data` files. For smaller quantized variants (e.g. 0.6B INT8 decoder_step at 571 MB), weights are inlined in the `.onnx` file. Encoder weights are always inlined.
+
+**Why `embed_tokens.bin` exists separately:** The two decoder models use different input strategies. `decoder_init` (prefill) accepts `input_ids` and has the embedding table built into its ONNX graph — this allows it to handle the audio feature scatter internally. `decoder_step` (autoregressive) accepts pre-looked-up `input_embeds` instead, keeping the ~594 MB embedding table out of its graph. The consumer loads `embed_tokens.bin` once at startup and performs the embedding lookup per token before calling `decoder_step`. This avoids duplicating the embedding weights across both decoder files while keeping `decoder_step` small for fast loading.
 
 Multiple quantization variants coexist in a single directory. The consumer selects a variant at load time (e.g. `Quantization::Int4` in [transcribe-rs](https://github.com/andrewleech/transcribe-rs)), which resolves `decoder_init.int4.onnx` with automatic fallback to `decoder_init.onnx` (FP32) for files without a quantized variant.
 
