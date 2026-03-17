@@ -108,21 +108,15 @@ def wer(references: list[str], hypotheses: list[str]) -> float:
 # ---------------------------------------------------------------------------
 
 def _resolve_model_path(model_dir: str, name: str, quant: str | None = None) -> str:
-    """Resolve model file with quantization suffix fallback.
+    """Resolve model file with quantization suffix, falling back to FP32.
 
-    Fallback chain: requested suffix → int8 (for int4) → FP32 (no suffix).
+    Looks for {name}.{quant}.onnx, falls back to {name}.onnx if not found.
     Matches the Rust resolve_model_path logic in transcribe-rs.
     """
     if quant:
-        # Try requested quantization
         path = os.path.join(model_dir, f"{name}.{quant}.onnx")
         if os.path.exists(path):
             return path
-        # int4 falls back to int8
-        if quant == "int4":
-            path = os.path.join(model_dir, f"{name}.int8.onnx")
-            if os.path.exists(path):
-                return path
     # FP32 fallback
     path = os.path.join(model_dir, f"{name}.onnx")
     if os.path.exists(path):
