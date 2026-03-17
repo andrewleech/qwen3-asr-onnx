@@ -6,7 +6,10 @@ Quantizes encoder and decoder ONNX files using onnxruntime dynamic quantization.
 Embedding table is part of the ONNX graph (Gather op) and is not affected by
 dynamic quantization, which only targets MatMul ops.
 
-Usage:
+Usage (in-place, adds .int8 files alongside FP32):
+    python quantize.py --input output/qwen3-asr-0.6b --output output/qwen3-asr-0.6b
+
+Usage (separate output dir):
     python quantize.py --input output/qwen3-asr-0.6b --output output/qwen3-asr-0.6b-int8
 """
 
@@ -19,7 +22,6 @@ import tempfile
 import onnx
 from onnxruntime.quantization import quantize_dynamic, QuantType
 
-from share_weights import share_external_models
 
 
 ONNX_FILES = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"]
@@ -140,9 +142,10 @@ def main():
     if args.nodes_to_exclude:
         exclude_nodes = [n.strip() for n in args.nodes_to_exclude.split(",")]
 
-    # Quantize ONNX files
+    # Quantize ONNX files with .int8. suffix for coexistence with FP32.
     # Encoder: MatMul-only — Conv quantization produces ConvInteger ops not supported by ORT <1.24.
     # Decoders: all ops (decoders have no Conv layers).
+    suffix = f".{args.weight_type}"  # e.g. ".int8"
     print(f"Quantizing ONNX files (weight_type={args.weight_type})...")
     for filename in ONNX_FILES:
         input_path = os.path.join(args.input, filename)
@@ -150,7 +153,10 @@ def main():
             print(f"  Skipping {filename} (not found)")
             continue
 
-        output_path = os.path.join(args.output, filename)
+        # Output with suffix: encoder.int8.onnx, decoder_init.int8.onnx, etc.
+        base = filename.removesuffix(".onnx")
+        output_filename = f"{base}{suffix}.onnx"
+        output_path = os.path.join(args.output, output_filename)
         encoder_only_matmul = ["MatMul"] if filename == "encoder.onnx" else None
         # Only apply node exclusions to decoder files (encoder uses op_type filtering)
         file_exclude = exclude_nodes if filename != "encoder.onnx" else None
@@ -161,8 +167,8 @@ def main():
             nodes_to_exclude=file_exclude,
         )
 
-    # Embed encoder weights into the INT8 .onnx proto (eliminates encoder.onnx.data)
-    encoder_out = os.path.join(args.output, "encoder.onnx")
+    # Embed encoder weights into the INT8 .onnx proto (eliminates .data file)
+    encoder_out = os.path.join(args.output, f"encoder{suffix}.onnx")
     encoder_data = encoder_out + ".data"
     if os.path.exists(encoder_data):
         print("  Embedding INT8 encoder weights into .onnx proto...")
@@ -170,41 +176,47 @@ def main():
         onnx.save(enc, encoder_out)
         os.remove(encoder_data)
 
-    # Inline quantized decoder_step weights into .onnx proto.
-    # The INT8 decoder_step has no embedding table, so it's well under 2 GB.
-    step_out = os.path.join(args.output, "decoder_step.onnx")
+    # Inline quantized decoder_step weights into .onnx proto if under 2 GB.
+    step_out = os.path.join(args.output, f"decoder_step{suffix}.onnx")
     step_data = step_out + ".data"
     if os.path.exists(step_data):
-        print("\nInlining INT8 decoder_step weights into .onnx proto...")
-        step_model = onnx.load(step_out, load_external_data=True)
-        onnx.save(step_model, step_out)
-        os.remove(step_data)
-        print(f"  decoder_step.onnx: {os.path.getsize(step_out) / 1e6:.1f} MB (self-contained)")
+        step_size = os.path.getsize(step_data)
+        if step_size < 1.8e9:  # safe margin under 2 GB protobuf limit
+            print(f"\nInlining INT8 decoder_step weights into .onnx proto...")
+            step_model = onnx.load(step_out, load_external_data=True)
+            onnx.save(step_model, step_out)
+            os.remove(step_data)
+            print(f"  {os.path.basename(step_out)}: {os.path.getsize(step_out) / 1e6:.1f} MB (self-contained)")
 
-    # Rename decoder_init external data for clarity
-    init_out = os.path.join(args.output, "decoder_init.onnx")
-    init_data = init_out + ".data"
-    if os.path.exists(init_data):
-        final_data = os.path.join(args.output, "decoder_init.onnx.data")
-        if init_data != final_data:
-            os.rename(init_data, final_data)
+    # Copy non-quantized files (skip if input == output)
+    if os.path.realpath(args.input) != os.path.realpath(args.output):
+        print("\nCopying non-quantized files...")
+        for fname in os.listdir(args.input):
+            # Skip quantized variants
+            if suffix in fname:
+                continue
+            src = os.path.join(args.input, fname)
+            dst = os.path.join(args.output, fname)
+            if os.path.isfile(src):
+                shutil.copy2(src, dst)
+                print(f"  Copied {fname}")
 
-    # Copy non-quantized files
-    print("\nCopying config and tokenizer...")
-    for filename in ["tokenizer.json", "tokenizer_config.json", "added_tokens.json", "vocab.json", "embed_tokens.bin"]:
-        src = os.path.join(args.input, filename)
-        if os.path.exists(src):
-            shutil.copy2(src, os.path.join(args.output, filename))
-            print(f"  Copied {filename}")
-
-    # Write updated config with quantization metadata
-    config_path = os.path.join(args.input, "config.json")
-    with open(config_path) as f:
-        config = json.load(f)
-    config["quantization"] = "int8_dynamic"
-
-    output_config = os.path.join(args.output, "config.json")
-    with open(output_config, "w") as f:
+    # Update config.json quantization metadata
+    config_path = os.path.join(args.output, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            config = json.load(f)
+    else:
+        config_src = os.path.join(args.input, "config.json")
+        with open(config_src) as f:
+            config = json.load(f)
+    quant_info = config.get("quantization", {})
+    if isinstance(quant_info, str):
+        quant_info = {}
+    for name in ["encoder", "decoder_init", "decoder_step"]:
+        quant_info[name] = f"{args.weight_type}_dynamic"
+    config["quantization"] = quant_info
+    with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
     print("  Updated config.json with quantization metadata")
 
