@@ -13,30 +13,27 @@ Each export produces a directory containing:
 
 | File | Description |
 |---|---|
-| `encoder.onnx` | Audio encoder (Conv2D stem + transformer + MLP projection), weights embedded in proto |
+| `encoder.onnx` | Audio encoder (Conv2D stem + transformer + MLP projection), weights inlined |
 | `decoder_init.onnx` | Decoder prefill (full sequence, outputs KV cache) |
+| `decoder_init.onnx.data` | External weights for decoder_init |
 | `decoder_step.onnx` | Decoder autoregressive step (single token + KV cache) |
-| `decoder_weights.data` | Shared external weights for both decoder models |
-| `embed_tokens.bin` | Token embedding matrix `[vocab_size, hidden_size]` as raw float32 (or float16 for INT8) |
+| `decoder_step.onnx.data` | External weights for decoder_step (may be inlined for smaller variants) |
+| `embed_tokens.bin` | Token embedding matrix `[vocab_size, hidden_size]` as raw float32 |
 | `tokenizer.json` | HuggingFace tokenizer |
 | `config.json` | Architecture config + special tokens + mel params |
 
-The two decoder `.onnx` files are small graph protos (~2 MB each). Both reference the same `decoder_weights.data` file via ONNX external data pointers. Encoder weights are embedded directly in the `.onnx` proto (under the 2 GB protobuf limit for both model sizes).
+The decoder `.onnx` files are small graph protos (~2 MB each) with weights stored in separate `.data` files via ONNX external data pointers. For smaller quantized variants (e.g. 0.6B INT8 decoder_step at 571 MB), weights may be inlined in the `.onnx` file when under the 2 GB protobuf limit. Encoder weights are always inlined.
 
-### FP32 vs INT8
+### Model Sizes
 
-Sizes below are for 0.6B; 1.7B models are proportionally larger.
+| Model | FP32 | Best quantized | Quantized size |
+|---|---|---|---|
+| **0.6B** | ~5.8 GB | INT8 AWQ α=0.2 | ~2.1 GB |
+| **1.7B** | ~16 GB | int4 GPTQ+RTN al4 | ~5.2 GB |
 
-|  | FP32 | INT8 |
-|---|---|---|
-| **Encoder** | 752 MB | 552 MB |
-| **Decoder** (shared weights) | 2.4 GB | 600 MB |
-| **Embeddings** | 622 MB (float32) | 311 MB (float16) |
-| **Total disk** | ~3.8 GB | ~1.1 GB |
+INT8 models (0.6B) are produced via AWQ smoothing followed by dynamic quantization. AWQ smoothing collects per-channel activation statistics from calibration audio, then migrates outlier activation variance into RMSNorm and linear weights. The smoothed FP32 model is mathematically equivalent to the original (verified by token-for-token comparison).
 
-The decoder weights are the same model exported as two graphs (prefill and autoregressive) sharing a single weights file, so both disk and runtime memory are roughly half what two separate exports would require.
-
-INT8 models are produced via AWQ smoothing followed by dynamic quantization. AWQ smoothing collects per-channel activation statistics from calibration audio, then migrates outlier activation variance from activations into RMSNorm and linear weights. The smoothed FP32 model is mathematically equivalent to the original (verified by token-for-token comparison). The subsequent INT8 quantization benefits from more uniform per-tensor weight scales.
+int4 models (1.7B) use ORT's `MatMulNBitsQuantizer` with per-group scales (block size 64). GPTQ calibration is used for `decoder_init` (better layer-wise reconstruction); RTN with `accuracy_level=4` is used for `decoder_step` (no quality difference, avoids impractical KV-cache calibration data).
 
 ### WER and speed vs Parakeet (LibriSpeech test-other, 200 samples, WSL/Linux CPU)
 
@@ -142,29 +139,28 @@ python collect_gptq_calib.py \
 `decoder_step` calibration (32 samples × 8 steps × KV cache ~20 MB each ≈ 5 GB .npz) is impractical to load alongside an 8.8 GB model. The recommended hybrid uses GPTQ for `decoder_init` and RTN al4 for `decoder_step`:
 
 ```bash
-# GPTQ decoder_init (requires config.json hidden during run — see note below)
-mv output/qwen3-asr-1.7b/config.json output/qwen3-asr-1.7b/config.json.bak
+# GPTQ decoder_init
 python quantize_nbits.py \
     --input output/qwen3-asr-1.7b \
-    --output output/qwen3-asr-1.7b-gptq-int4 \
-    --bits 4 --block-size 64 --algo gptq \
-    --calib-data calibration_cache/1.7b_gptq_init.npz \
+    --output output/qwen3-asr-1.7b-int4 \
+    --bits 4 --block-size 64 --accuracy-level 4 \
+    --algo gptq --calib-data calibration_cache/1.7b_gptq_init.npz \
     --decoders decoder_init
-mv output/qwen3-asr-1.7b/config.json.bak output/qwen3-asr-1.7b/config.json
 
 # RTN al4 decoder_step (quantize into same output dir)
 python quantize_nbits.py \
     --input output/qwen3-asr-1.7b \
-    --output output/qwen3-asr-1.7b-gptq-int4 \
+    --output output/qwen3-asr-1.7b-int4 \
     --bits 4 --block-size 64 --accuracy-level 4 \
     --decoders decoder_step
+
+# Clean up GPTQ temp files in source dir
+rm -f output/qwen3-asr-1.7b/*-*-*-*-*.data output/qwen3-asr-1.7b/*_augment.onnx
 ```
 
-**Note:** ORT's GPTQ implementation calls `AutoConfig.from_pretrained()` on the model directory, which fails on the custom `qwen3_asr` model type. Hiding `config.json` before the run bypasses this. GPTQ also writes large UUID-named temporary `.data` files (~6.5 GB each) in the *source* model directory; delete them after the run:
+The script automatically handles `config.json` hiding during GPTQ (ORT's neural_compressor calls `AutoConfig.from_pretrained()` which fails on the custom `qwen3_asr` model type), file renaming to standard `{name}.onnx` names, external data reference fixup, and `com.microsoft` opset import for `MatMulNBits` nodes.
 
-```bash
-rm -f output/qwen3-asr-1.7b/*.data output/qwen3-asr-1.7b/*_augment.onnx
-```
+GPTQ writes large UUID-named temporary `.data` files (~6.5 GB each) in the *source* model directory — the cleanup command above removes them.
 
 ### Evaluate WER
 
@@ -235,17 +231,13 @@ uv run python collect_gptq_calib.py \
     --output calibration_cache/1.7b_gptq_init.npz \
     --target decoder_init
 
-# GPTQ decoder_init (hide config.json to bypass AutoConfig failure on qwen3_asr type)
-mv output/qwen3-asr-1.7b/config.json output/qwen3-asr-1.7b/config.json.bak
+# GPTQ decoder_init
 uv run python quantize_nbits.py \
     --input output/qwen3-asr-1.7b \
     --output output/qwen3-asr-1.7b-int4 \
-    --bits 4 --block-size 64 --algo gptq \
-    --calib-data calibration_cache/1.7b_gptq_init.npz \
+    --bits 4 --block-size 64 --accuracy-level 4 \
+    --algo gptq --calib-data calibration_cache/1.7b_gptq_init.npz \
     --decoders decoder_init
-mv output/qwen3-asr-1.7b/config.json.bak output/qwen3-asr-1.7b/config.json
-# Clean up GPTQ temp files in source dir
-rm -f output/qwen3-asr-1.7b/*.data output/qwen3-asr-1.7b/*_augment.onnx
 
 # RTN al4 decoder_step (no calibration data needed)
 uv run python quantize_nbits.py \
@@ -253,6 +245,9 @@ uv run python quantize_nbits.py \
     --output output/qwen3-asr-1.7b-int4 \
     --bits 4 --block-size 64 --accuracy-level 4 \
     --decoders decoder_step
+
+# Clean up GPTQ temp files in source dir
+rm -f output/qwen3-asr-1.7b/*-*-*-*-*.data output/qwen3-asr-1.7b/*_augment.onnx
 ```
 
 Disk peak during 1.7B int4: ~13 GB (8.8 GB FP32 source + 4.3 GB output). GPTQ writes ~6.5 GB temporary `.data` files to the source directory during the `decoder_init` step — clean them up as shown above.
