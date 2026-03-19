@@ -19,13 +19,15 @@ Each model directory contains FP32 files plus quantized variants with suffixed n
 | `decoder_init.int4.onnx` + `.data` | int4 decoder_init variant |
 | `decoder_step.onnx` + `.data` | FP32 decoder autoregressive step (single token + KV cache) |
 | `decoder_step.int4.onnx` + `.data` | int4 decoder_step variant |
-| `embed_tokens.bin` | Token embedding matrix `[vocab_size, hidden_size]` as raw float32 (see below) |
+| `embed_tokens.bin` | Token embedding matrix `[vocab_size, hidden_size]`, FP16 (see below and `embed_tokens_dtype` in config.json) |
 | `tokenizer.json` | HuggingFace tokenizer |
 | `config.json` | Architecture config + special tokens + mel params |
 
 The decoder `.onnx` files are small graph protos (~2 MB each) with weights in separate `.data` files. Encoder weights are always inlined.
 
-**Why `embed_tokens.bin` exists separately:** The two decoder models use different input strategies. `decoder_init` (prefill) accepts `input_ids` and has the embedding table built into its ONNX graph — this allows it to handle the audio feature scatter internally. `decoder_step` (autoregressive) accepts pre-looked-up `input_embeds` instead, keeping the ~594 MB embedding table out of its graph. The consumer loads `embed_tokens.bin` once at startup and performs the embedding lookup per token before calling `decoder_step`. This avoids duplicating the embedding weights across both decoder files while keeping `decoder_step` small for fast loading.
+**Why `embed_tokens.bin` exists separately:** The two decoder models use different input strategies. `decoder_init` (prefill) accepts `input_ids` and has the embedding table built into its ONNX graph — this allows it to handle the audio feature scatter internally. `decoder_step` (autoregressive) accepts pre-looked-up `input_embeds` instead, keeping the embedding table out of its graph. The consumer loads `embed_tokens.bin` once at startup and performs the embedding lookup per token before calling `decoder_step`. This avoids duplicating the embedding weights across both decoder files while keeping `decoder_step` small for fast loading.
+
+The file is stored as FP16 (half the FP32 size, zero measured WER impact). The `embed_tokens_dtype` field in `config.json` indicates the storage format. Consumers should cast to FP32 after loading for inference.
 
 Multiple quantization variants coexist in a single directory. The consumer selects a variant at load time (e.g. `Quantization::Int4` in [transcribe-rs](https://github.com/andrewleech/transcribe-rs)), which resolves `decoder_init.int4.onnx` with automatic fallback to `decoder_init.onnx` (FP32) for files without a quantized variant.
 
@@ -33,8 +35,8 @@ Multiple quantization variants coexist in a single directory. The consumer selec
 
 | Model | Variant | WER | RTF (CPU) | Download |
 |---|---|---|---|---|
-| **0.6B** | int4 RTN al4 | 5.08% | 0.16x | ~2.6 GB |
-| **1.7B** | int4 GPTQ+RTN al4 | 4.25% | 0.37x | ~5.6 GB |
+| **0.6B** | int4 RTN al4 | 5.16% | 0.16x | ~2.3 GB |
+| **1.7B** | int4 GPTQ+RTN al4 | 4.25% | 0.37x | ~5.3 GB |
 | Parakeet-TDT 0.6B INT8 | reference | 5.45% | 0.16x | — |
 
 The int4 variants use FP32 encoders (`encoder.int4.onnx`). INT8 encoders were tested but degrade 0.6B WER by ~1pp due to quantization of the windowed Conv2D layers.
@@ -43,8 +45,8 @@ The int4 variants use FP32 encoders (`encoder.int4.onnx`). INT8 encoders were te
 
 | Model | FP32 | int4 (recommended) |
 |---|---|---|
-| **0.6B** | ~6.2 GB | ~2.6 GB |
-| **1.7B** | ~16 GB | ~5.6 GB |
+| **0.6B** | ~6.0 GB | ~2.3 GB |
+| **1.7B** | ~15.4 GB | ~5.3 GB |
 
 int4 models use ORT's `MatMulNBitsQuantizer` with per-group scales (block size 64, accuracy_level=4). For 1.7B, GPTQ calibration is used for `decoder_init` (better layer-wise reconstruction); RTN is used for `decoder_step` (no quality difference, avoids impractical KV-cache calibration data).
 
@@ -55,13 +57,13 @@ int4 models use ORT's `MatMulNBitsQuantizer` with per-group scales (block size 6
 | 1.7B FP32 | 3.79% | ~0.70x | ~0.70x |
 | 1.7B int4 GPTQ+RTN al4 | 4.25% | 0.37x | 0.37x |
 | 0.6B FP32 | 4.42% | 0.29x | 0.32x |
-| **0.6B int4 RTN al4** | **5.08%** | **0.16x** | — |
+| **0.6B int4 RTN al4** | **5.16%** | **0.16x** | — |
 | 0.6B AWQ INT8 α=0.2 | 5.21% | 0.14x | 0.17x |
 | Parakeet-TDT 0.6B INT8 | 5.45% | 0.16x | 0.13x |
 
 RTF < 1.0 = faster than real-time. Lower is better for both WER and RTF. Measured on Ryzen AI 7 PRO 350 (WSL/Linux, ORT 1.22).
 
-**0.6B int4** is the recommended configuration: 5.08% WER at 0.16x RTF, matching Parakeet speed with lower WER and full punctuation output.
+**0.6B int4** is the recommended configuration: 5.16% WER at 0.16x RTF, matching Parakeet speed with lower WER and full punctuation output. `embed_tokens.bin` is shipped as FP16 (297 MB vs 594 MB FP32) with zero measured WER impact.
 
 **1.7B int4** is the accuracy option: 4.25% WER at 0.37x RTF. AWQ INT8 for 1.7B is not recommended — it causes degraded special token prediction (9% WER).
 
@@ -165,6 +167,9 @@ cp output/qwen3-asr-1.7b/encoder.onnx output/qwen3-asr-1.7b/encoder.int4.onnx
 
 # Clean up GPTQ temp files
 rm -f output/qwen3-asr-1.7b/*-*-*-*-*.data output/qwen3-asr-1.7b/*_augment.onnx
+
+# Convert embed_tokens to FP16
+uv run python convert_embed_fp16.py --model-dir output/qwen3-asr-1.7b
 ```
 
 The script handles `config.json` hiding during GPTQ (ORT's neural_compressor calls `AutoConfig.from_pretrained()` which fails on the custom `qwen3_asr` model type) and adds the `com.microsoft` opset import for `MatMulNBits` nodes.
@@ -240,6 +245,9 @@ uv run python quantize_nbits.py \
 
 # Copy FP32 encoder as the int4 encoder
 cp output/qwen3-asr-0.6b/encoder.onnx output/qwen3-asr-0.6b/encoder.int4.onnx
+
+# Convert embed_tokens to FP16 (halves file size, zero WER impact)
+uv run python convert_embed_fp16.py --model-dir output/qwen3-asr-0.6b
 ```
 
 ### 1.7B (FP32 + int4 GPTQ hybrid)
@@ -280,6 +288,9 @@ cp output/qwen3-asr-1.7b/encoder.onnx output/qwen3-asr-1.7b/encoder.int4.onnx
 
 # Clean up GPTQ temp files
 rm -f output/qwen3-asr-1.7b/*-*-*-*-*.data output/qwen3-asr-1.7b/*_augment.onnx
+
+# Convert embed_tokens to FP16
+uv run python convert_embed_fp16.py --model-dir output/qwen3-asr-1.7b
 ```
 
 ### WER evaluation
@@ -330,7 +341,7 @@ output/
 │   ├── decoder_step.onnx.data
 │   ├── decoder_step.int4.onnx    # int4 RTN al4
 │   ├── decoder_step.int4.onnx.data
-│   ├── embed_tokens.bin          # Shared across all variants
+│   ├── embed_tokens.bin          # FP16 embedding table (see embed_tokens_dtype in config.json)
 │   ├── config.json
 │   └── tokenizer.json
 ├── qwen3-asr-1.7b/              # All 1.7B variants in one directory
@@ -344,13 +355,13 @@ output/
 │   ├── decoder_step.onnx.data
 │   ├── decoder_step.int4.onnx    # int4 RTN al4
 │   ├── decoder_step.int4.onnx.data
-│   ├── embed_tokens.bin          # Shared across all variants
+│   ├── embed_tokens.bin          # FP16 embedding table (see embed_tokens_dtype in config.json)
 │   ├── config.json
 │   └── tokenizer.json
 └── calibration_cache/            # GPTQ calibration data (reusable)
 ```
 
-Each model directory is self-contained. For distribution, the int4 variant files are: `encoder.int4.onnx` + `decoder_init.int4.onnx*` + `decoder_step.int4.onnx*` + `embed_tokens.bin` + `config.json` + `tokenizer.json`. The FP32 files are optional extras for users who need maximum accuracy.
+Each model directory is self-contained. For distribution, the int4 variant files are: `encoder.int4.onnx` + `decoder_init.int4.onnx*` + `decoder_step.int4.onnx*` + `embed_tokens.bin` (FP16) + `config.json` + `tokenizer.json`. The FP32 files are optional extras for users who need maximum accuracy.
 
 ## Architecture
 
@@ -385,7 +396,7 @@ WER measured on LibriSpeech test-other (200 samples).
 
 | Model | FP32 WER | INT8 naive | INT8 AWQ α=0.2 | int4 RTN al4 | int4 GPTQ+RTN al4 |
 |---|---|---|---|---|---|
-| 0.6B | 4.42% | 6.7% | 5.21% | 5.08% | — |
+| 0.6B | 4.42% | 6.7% | 5.21% | **5.16%** | — |
 | 1.7B | 3.79% | — | 9.0% | 4.3% | 4.25% |
 
 AWQ smoothing reduces the 0.6B INT8 WER penalty from +2.3pp (naive) to +0.8pp (α=0.2). 1.7B AWQ INT8 is not recommended — outlier weights in the 1.7B decoder cause special token prediction failures under per-tensor INT8 quantization regardless of smoothing. int4 MatMulNBits with per-group scales handles these outliers locally; the 1.7B int4 WER penalty is only +0.46pp vs FP32.

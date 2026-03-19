@@ -69,8 +69,9 @@ def load_embed(model_dir: str) -> np.ndarray:
 
 def stream_audio(n: int):
     """Yield float32 16kHz audio arrays from LibriSpeech test-other (streaming)."""
+    import io
+    import soundfile as sf
     from datasets import Audio, load_dataset
-    import librosa
 
     ds = load_dataset(
         "openslr/librispeech_asr",
@@ -79,19 +80,25 @@ def stream_audio(n: int):
         streaming=True,
         trust_remote_code=True,
     )
-    ds = ds.cast_column("audio", Audio(decode=True))
+    ds = ds.cast_column("audio", Audio(decode=False))
 
     yielded = 0
     for sample in ds:
         if yielded >= n:
             break
-        arr = sample["audio"]["array"].astype(np.float32)
-        sr = sample["audio"]["sampling_rate"]
+        raw = sample["audio"]["bytes"]
+        if raw is None:
+            continue
+        try:
+            arr, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        except Exception:
+            continue
         if arr.ndim > 1:
             arr = arr.mean(axis=1)
         if sr != 16000:
+            import librosa
             arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
-        yield arr
+        yield arr.astype(np.float32)
         yielded += 1
 
 

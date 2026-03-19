@@ -20,8 +20,12 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import shutil
+import subprocess
+
+import numpy as np
 
 
 # FP32 model files (encoder weights inlined, decoder weights external)
@@ -34,8 +38,11 @@ FP32_FILES = [
 ]
 
 # int4 model files (already suffixed by quantize_nbits.py)
+# encoder.int4.onnx is a copy of encoder.onnx (FP32) — INT4/INT8 encoders degrade WER.
+# Optional .data file included for quantized encoders that use external weights.
 INT4_FILES = [
     "encoder.int4.onnx",
+    "encoder.int4.onnx.data",  # optional — only present if encoder is truly quantized
     "decoder_init.int4.onnx",
     "decoder_init.int4.onnx.data",
     "decoder_step.int4.onnx",
@@ -44,7 +51,7 @@ INT4_FILES = [
 
 # Shared across all variants
 SHARED_FILES = [
-    "embed_tokens.bin",
+    # embed_tokens.bin handled separately (FP16 conversion)
     "config.json",
     "preprocessor_config.json",
     "tokenizer.json",
@@ -149,6 +156,42 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         print("\n  No int4 files found, skipping")
     shared_total = copy_file_set(input_dir, output_dir, SHARED_FILES, "Shared metadata", hardlink=hardlink)
 
+    # Embed tokens — ship as FP16 to halve file size (zero WER impact per experiment [104]).
+    # Prefer embed_tokens.fp16.bin if present, otherwise convert embed_tokens.bin on the fly.
+    embed_total = 0
+    fp16_src = os.path.join(input_dir, "embed_tokens.fp16.bin")
+    fp32_src = os.path.join(input_dir, "embed_tokens.bin")
+    embed_dst = os.path.join(output_dir, "embed_tokens.bin")
+    print(f"\nEmbed tokens:")
+    if os.path.exists(fp16_src):
+        embed_total += copy_file(fp16_src, embed_dst, hardlink=False)  # never hardlink (different name)
+        print(f"    (copied FP16 as embed_tokens.bin)")
+    elif os.path.exists(fp32_src):
+        print(f"    Converting FP32 → FP16...")
+        data = np.fromfile(fp32_src, dtype=np.float32)
+        data.astype(np.float16).tofile(embed_dst)
+        embed_total += os.path.getsize(embed_dst)
+        print(f"    embed_tokens.bin ({format_size(embed_total)}) — converted from FP32")
+    else:
+        print(f"    WARNING: no embed_tokens found in {input_dir}")
+
+    # Ensure config.json has embed_tokens_dtype: float16.
+    # Break any hardlink first (config.json may be hardlinked to the source dir).
+    config_dst = os.path.join(output_dir, "config.json")
+    if os.path.exists(config_dst) and embed_total > 0:
+        with open(config_dst) as f:
+            cfg = json.load(f)
+        if cfg.get("embed_tokens_dtype") != "float16":
+            cfg["embed_tokens_dtype"] = "float16"
+            # Write to a temp file then replace to break hardlinks
+            tmp = config_dst + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(cfg, f, indent=2)
+            os.replace(tmp, config_dst)
+            print(f"    Set embed_tokens_dtype=float16 in config.json")
+
+    shared_total += embed_total
+
     # Test WAVs
     if test_wavs_src is not None:
         test_wavs_dir = os.path.join(output_dir, "test_wavs")
@@ -173,6 +216,43 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     if not verify_ort_load(output_dir):
         print("ERROR: ORT verification failed")
         return False
+
+    # Create per-variant tarballs (FP32 and int4) in the output directory's parent.
+    # Each tarball contains shared files + variant-specific ONNX files.
+    tar_dir = os.path.dirname(os.path.abspath(output_dir))
+    base_name = os.path.basename(output_dir.rstrip("/"))
+    shared_names = [f for f in SHARED_FILES if os.path.exists(os.path.join(output_dir, f))]
+    shared_names.append("embed_tokens.bin")
+
+    for variant, file_list in [("", FP32_FILES), ("-int4", INT4_FILES)]:
+        if variant == "-int4" and not has_int4:
+            continue
+        archive_name = f"{base_name}{variant}"
+        tar_name = f"{archive_name}.tar.gz"
+        tar_path = os.path.join(tar_dir, tar_name)
+        # Filter to files that exist in the release dir
+        members = [f for f in file_list + shared_names
+                    if os.path.exists(os.path.join(output_dir, f))]
+        tar_members = [f"{base_name}/{f}" for f in members]
+
+        print(f"\nCreating {tar_name}...")
+        cmd = ["tar", "cf", "-", "-C", tar_dir]
+        # Rename directory inside tar to match archive name (e.g. qwen3-asr-0.6b-int4/)
+        if base_name != archive_name:
+            cmd += [f"--transform=s,^{base_name},{archive_name},"]
+        cmd += tar_members
+        with open(tar_path, "wb") as f:
+            tar_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+            gz_proc = subprocess.Popen(["gzip", "-1"], stdin=tar_proc.stdout, stdout=f)
+            tar_proc.stdout.close()
+            gz_proc.wait()
+            tar_proc.wait()
+
+        if tar_proc.returncode == 0 and gz_proc.returncode == 0:
+            size = os.path.getsize(tar_path)
+            print(f"  {tar_name}: {format_size(size)}")
+        else:
+            print(f"  ERROR creating {tar_name}")
 
     print("\nDone.")
     return True

@@ -149,10 +149,10 @@ def load_embed(model_dir: str) -> np.ndarray:
     # v2+ format: embed_tokens_shape removed, derive from decoder config
     if "embed_tokens_shape" in cfg:
         shape = cfg["embed_tokens_shape"]
-        dtype_str = cfg.get("embed_tokens_dtype", "float32")
     else:
         shape = [cfg["decoder"]["vocab_size"], cfg["decoder"]["hidden_size"]]
-        dtype_str = "float32"
+    # embed_tokens_dtype applies regardless of whether embed_tokens_shape is present
+    dtype_str = cfg.get("embed_tokens_dtype", "float32")
     dtype = np.float16 if dtype_str == "float16" else np.float32
     embed = np.fromfile(os.path.join(model_dir, "embed_tokens.bin"), dtype=dtype).reshape(shape)
     return embed.astype(np.float32)
@@ -262,6 +262,8 @@ def evaluate(model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[s
     print()
 
     results: dict[str, dict[str, list]] = {name: {} for name, *_ in models}
+    infer_times: dict[str, float] = {name: 0.0 for name, *_ in models}
+    total_audio_secs: float = 0.0
 
     for dataset_key in dataset_keys:
         cfg = DATASET_CONFIGS[dataset_key]
@@ -282,12 +284,16 @@ def evaluate(model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[s
                 continue
 
             sample_count += 1
+            audio_secs = len(audio) / 16000.0
+            total_audio_secs += audio_secs
             elapsed = time.time() - t_start
             print(f"  [{sample_count:4d}/{n_samples}] {elapsed:6.0f}s  ref: {ref_norm[:60]}")
 
             for name, model_dir, sessions, embed, tokenizer in models:
                 try:
+                    t0 = time.time()
                     hyp_raw = _run(sessions, embed, tokenizer, audio)
+                    infer_times[name] += time.time() - t0
                     hyp_norm = normalize(hyp_raw)
                 except Exception as e:
                     print(f"    {name}: ERROR {e}")
@@ -306,7 +312,7 @@ def evaluate(model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[s
     print(f"{'SUMMARY':^72}")
     print(f"{'='*72}")
     col_w = max(len(n) for n, *_ in models) + 2
-    header = f"{'Dataset':<28} {'Model':<{col_w}} {'Samples':>8} {'WER%':>7}"
+    header = f"{'Dataset':<28} {'Model':<{col_w}} {'Samples':>8} {'WER%':>7} {'Time':>8} {'RTF':>7}"
     print(header)
     print("-" * len(header))
 
@@ -321,8 +327,12 @@ def evaluate(model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[s
             hyps = [h for _, h in pairs]
             w = wer(refs, hyps) * 100
             n = len(pairs)
-            print(f"{label:<28} {name:<{col_w}} {n:>8} {w:>7.2f}")
-            summary.append({"dataset": label, "model": name, "n": n, "wer": round(w, 4)})
+            t = infer_times[name]
+            rtf = t / total_audio_secs if total_audio_secs > 0 else 0
+            print(f"{label:<28} {name:<{col_w}} {n:>8} {w:>7.2f} {t:>7.1f}s {rtf:>6.2f}x")
+            summary.append({"dataset": label, "model": name, "n": n, "wer": round(w, 4),
+                            "infer_secs": round(t, 1), "audio_secs": round(total_audio_secs, 1),
+                            "rtf": round(rtf, 3)})
 
     if output_path:
         with open(output_path, "w") as f:

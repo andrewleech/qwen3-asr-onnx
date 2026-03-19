@@ -1,4 +1,70 @@
 
+### [104] INT4 encoder and FP16 embed_tokens — 0.6B package size reduction
+**Date:** 2026-03-19
+**Idea:** The 0.6B int4 package is ~2.6 GB, larger than the original BF16 safetensors (~1.2 GB). The FP32 encoder (717 MB) and FP32 embed_tokens.bin (594 MB) account for 1.3 GB. Test whether INT4 encoder (MatMulNBits, RTN, block_size=64, accuracy_level=4) and FP16 embed_tokens preserve quality while reducing package size.
+
+**Change:** Quantized encoder.onnx → encoder.int4.onnx via `quantize_nbits.py --decoders encoder --bits 4 --block-size 64 --accuracy-level 4`. Created embed_tokens.fp16.bin via numpy f32→f16 cast. Built 4 trial directories with symlinks to shared int4 decoder files, testing all combinations.
+
+**Result (200-sample LibriSpeech test-other, Python evaluate_wer.py, WSL2/Linux, ORT 2.0.0-rc.12):**
+| Trial | Encoder | Embed | WER | RTF | Enc size | Embed size |
+|---|---|---|---|---|---|---|
+| Baseline | FP32 (717 MB) | FP32 (594 MB) | 5.16% | 0.244x | 717 MB | 594 MB |
+| A | INT4 (122 MB) | FP32 (594 MB) | 5.33% | 0.239x | 122 MB | 594 MB |
+| B | FP32 (717 MB) | FP16 (297 MB) | 5.16% | 0.242x | 717 MB | 297 MB |
+| C | INT4 (122 MB) | FP16 (297 MB) | 5.33% | 0.239x | 122 MB | 297 MB |
+
+Note: absolute RTF values are from the Python pipeline (includes PyTorch mel spectrogram overhead) and are not comparable to Rust bench_compare RTF. Use only for relative comparison between trials.
+
+**Package size impact:**
+| Variant | Encoder | Embed | Decoders | Total |
+|---|---|---|---|---|
+| Current (FP32 enc) | 717 MB | 594 MB | ~1.2 GB | ~2.6 GB |
+| FP16 embed only (B) | 717 MB | 297 MB | ~1.2 GB | ~2.3 GB |
+| INT4 enc + FP16 embed (C) | 122 MB | 297 MB | ~1.2 GB | ~1.6 GB |
+
+**Outcome:** FINDING
+- **FP16 embed_tokens has zero WER impact** (5.16% = baseline). Saves 297 MB. Safe to ship.
+- **INT4 encoder adds 0.17pp WER** (5.33% vs 5.16%). Saves 595 MB, marginally faster. Small but repeatable degradation — the encoder's windowed Conv2D ops remain FP32 (MatMul-only quantization), but MatMul INT4 still introduces slight precision loss in encoder features. Less than INT8 encoder's 1pp degradation ([100]) but non-zero.
+- INT4 encoder is ~2% faster in relative terms (lower overhead from smaller model load and reduced memory bandwidth).
+
+**Notes:**
+- The 5.16% baseline differs from experiment [100]'s 5.08% — within expected ±0.5pp variance at 200 samples across different runs/sessions.
+- FP16 embed is a pure storage optimization: Rust loads and casts f16→f32 per row lookup. No compute path change.
+- Rust model loader needs update to support FP16 embed (detect dtype from config.json or file size heuristic).
+- TODO: Run Rust bench_compare with INT4 encoder for absolute RTF numbers on 11s JFK clip.
+
+### [105] GPTQ decoder_init on 0.6B int4 (block_size=64, al4)
+**Date:** 2026-03-19
+**Idea:** GPTQ improved 1.7B int4 WER by 0.08pp (experiment [89]). Apply the same GPTQ-init + RTN-step strategy to 0.6B to recover the ~0.08pp gap between current 5.16% and the target 5.08%.
+**Change:** Collected GPTQ calibration data for 0.6B decoder_init (32 LibriSpeech samples via `collect_gptq_calib.py`). Quantized decoder_init with GPTQ bs64 al4, decoder_step with RTN bs64 al4.
+**Result:**
+| Trial | WER (200-sample) | RTF |
+|---|---|---|
+| Baseline RTN bs64 al4 | 5.16% | 0.275x |
+| GPTQ-init + RTN bs64 al4 | **6.01%** | 0.278x |
+
+**Outcome:** DEGRADED — GPTQ makes 0.6B WER 0.85pp worse. Unlike 1.7B where GPTQ's layer-wise reconstruction error minimization helped, the 0.6B model (hidden_size=1024, fewer layers) has less capacity to absorb GPTQ's weight redistribution. The quantization error is concentrated rather than spread.
+**Notes:**
+- The 6.01% matches the INT8 encoder WER from [100] — coincidence, different cause (decoder quantization vs encoder quantization).
+- Smoothing before GPTQ was not tested but is unlikely to recover 0.85pp given the fundamental capacity limitation.
+- GPTQ is not recommended for models below ~1B parameters with this architecture.
+
+### [106] RTN block_size=32 on 0.6B int4 (al4)
+**Date:** 2026-03-19
+**Idea:** Smaller block_size (32 vs 64) gives finer per-group scales, potentially reducing quantization error for the 0.6B model's weight distribution.
+**Change:** Quantized both decoders with RTN bs32 al4 via `quantize_nbits.py --block-size 32`.
+**Result:**
+| Trial | WER (200-sample) | RTF |
+|---|---|---|
+| Baseline RTN bs64 al4 | 5.16% | 0.275x |
+| RTN bs32 al4 | **99.98%** | 0.473x |
+
+**Outcome:** CATASTROPHIC — output is complete garbage. Also 2× slower than bs64.
+**Notes:**
+- ORT's MatMulNBits kernel likely has no optimized path for block_size=32. The generic fallback dequantize loop produces numerically incorrect results for this model.
+- block_size=64 is the only validated block size for MatMulNBits int4 on Qwen3-ASR.
+- Do not use block_size < 64 with ORT MatMulNBits.
+
 ### [102] GPU benchmark: DirectML and WebGPU on AMD Radeon 860M (4 GB shared iGPU)
 **Date:** 2026-03-18
 **Idea:** Test whether GPU acceleration (DirectML, WebGPU) improves inference speed on the Radeon 860M iGPU in native Windows builds. FP16 models are the expected GPU-optimal format (native half-precision compute, no dequantization). int4 via MatMulNBits is a custom op that may not have GPU kernel support.

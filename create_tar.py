@@ -21,10 +21,12 @@ from huggingface_hub import HfApi
 # Shared metadata files included in every archive
 METADATA = ["embed_tokens.bin", "config.json", "tokenizer.json"]
 
+# Archives are built from release/ dirs (produced by package.py), which contain
+# the correct FP16 embed_tokens.bin and patched config.json.
 ARCHIVES = [
     {
         "name": "qwen3-asr-0.6b",
-        "source_dir": "output/qwen3-asr-0.6b",
+        "source_dir": "release/qwen3-asr-0.6b",
         "repo": "andrewleech/qwen3-asr-0.6b-onnx",
         "files": [
             "encoder.onnx",
@@ -36,7 +38,7 @@ ARCHIVES = [
     },
     {
         "name": "qwen3-asr-0.6b-int4",
-        "source_dir": "output/qwen3-asr-0.6b",
+        "source_dir": "release/qwen3-asr-0.6b",
         "repo": "andrewleech/qwen3-asr-0.6b-onnx",
         "files": [
             "encoder.int4.onnx",
@@ -48,7 +50,7 @@ ARCHIVES = [
     },
     {
         "name": "qwen3-asr-1.7b",
-        "source_dir": "output/qwen3-asr-1.7b",
+        "source_dir": "release/qwen3-asr-1.7b",
         "repo": "andrewleech/qwen3-asr-1.7b-onnx",
         "files": [
             "encoder.onnx",
@@ -60,7 +62,7 @@ ARCHIVES = [
     },
     {
         "name": "qwen3-asr-1.7b-int4",
-        "source_dir": "output/qwen3-asr-1.7b",
+        "source_dir": "release/qwen3-asr-1.7b",
         "repo": "andrewleech/qwen3-asr-1.7b-onnx",
         "files": [
             "encoder.int4.onnx",
