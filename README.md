@@ -33,22 +33,43 @@ Multiple quantization variants coexist in a single directory. The consumer selec
 
 ### Recommended Variants
 
-| Model | Variant | WER | RTF (CPU) | Download |
+| Model | Variant | WER | RTF (CPU) | tar.gz download |
 |---|---|---|---|---|
-| **0.6B** | int4 RTN al4 | 5.16% | 0.16x | ~2.3 GB |
-| **1.7B** | int4 GPTQ+RTN al4 | 4.25% | 0.37x | ~5.3 GB |
+| **0.6B** | int4 RTN al4 | 5.16% | 0.16x | 1.4 GB |
+| **1.7B** | int4 GPTQ+RTN al4 | 4.25% | 0.37x | 3.2 GB |
 | Parakeet-TDT 0.6B INT8 | reference | 5.45% | 0.16x | — |
 
-The int4 variants use FP32 encoders (`encoder.int4.onnx`). INT8 encoders were tested but degrade 0.6B WER by ~1pp due to quantization of the windowed Conv2D layers.
+WER measured on LibriSpeech test-other (200 samples). RTF < 1.0 = faster than real-time.
 
-### All Published Variants
+#### Package contents — int4 (recommended)
 
-| Model | FP32 | int4 (recommended) |
-|---|---|---|
-| **0.6B** | ~6.0 GB | ~2.3 GB |
-| **1.7B** | ~15.4 GB | ~5.3 GB |
+Each int4 package contains the files needed for quantized inference:
 
-int4 models use ORT's `MatMulNBitsQuantizer` with per-group scales (block size 64, accuracy_level=4). For 1.7B, GPTQ calibration is used for `decoder_init` (better layer-wise reconstruction); RTN is used for `decoder_step` (no quality difference, avoids impractical KV-cache calibration data).
+| Component | 0.6B | 1.7B | Format | Why this format |
+|---|---|---|---|---|
+| `encoder.int4.onnx` | 716 MB | 1,217 MB | **FP32** | FP16 breaks (attention mask overflows FP16 range); INT4/INT8 degrade WER by 0.2–1pp |
+| `decoder_init.int4.onnx` + `.data` | 835 MB | 1,954 MB | **int4** | MatMulNBits bs64 al4. 1.7B uses GPTQ calibration; 0.6B uses RTN (GPTQ hurts <1B models) |
+| `decoder_step.int4.onnx` + `.data` | 325 MB | 937 MB | **int4** | RTN al4 for both sizes (no quality difference vs GPTQ for autoregressive step) |
+| `embed_tokens.bin` | 297 MB | 593 MB | **FP16** | Zero measured WER impact vs FP32. Consumer casts to FP32 at lookup time |
+| `config.json` + `tokenizer.json` | ~11 MB | ~11 MB | — | Architecture config, special tokens, mel params, tokenizer |
+
+Uncompressed total: 0.6B = 2.2 GB, 1.7B = 4.7 GB.
+
+The encoder is the largest component because it must remain FP32. The original model uses BF16 weights (same range as FP32, ±3.4e38). The encoder's attention masking uses values at the FP32 range limit that overflow in FP16 (max ±65,504), producing broken output. INT4 encoder saves 595 MB but adds 0.17pp WER from quantization of the windowed Conv2D layers.
+
+#### Package contents — FP32
+
+FP32 packages contain unquantized models for maximum accuracy:
+
+| Component | 0.6B | 1.7B | Format |
+|---|---|---|---|
+| `encoder.onnx` | 716 MB | 1,217 MB | FP32 |
+| `decoder_init.onnx` + `.data` | 2,275 MB | 6,565 MB | FP32 |
+| `decoder_step.onnx` + `.data` | 2,275 MB | 6,565 MB | FP32 |
+| `embed_tokens.bin` | 297 MB | 593 MB | FP16 |
+| `config.json` + `tokenizer.json` | ~11 MB | ~11 MB | — |
+
+tar.gz download: 0.6B = 3.0 GB, 1.7B = 7.9 GB.
 
 ### WER and Speed (LibriSpeech test-other, 200 samples, CPU)
 
@@ -61,11 +82,7 @@ int4 models use ORT's `MatMulNBitsQuantizer` with per-group scales (block size 6
 | 0.6B AWQ INT8 α=0.2 | 5.21% | 0.14x | 0.17x |
 | Parakeet-TDT 0.6B INT8 | 5.45% | 0.16x | 0.13x |
 
-RTF < 1.0 = faster than real-time. Lower is better for both WER and RTF. Measured on Ryzen AI 7 PRO 350 (WSL/Linux, ORT 1.22).
-
-**0.6B int4** is the recommended configuration: 5.16% WER at 0.16x RTF, matching Parakeet speed with lower WER and full punctuation output. `embed_tokens.bin` is shipped as FP16 (297 MB vs 594 MB FP32) with zero measured WER impact.
-
-**1.7B int4** is the accuracy option: 4.25% WER at 0.37x RTF. AWQ INT8 for 1.7B is not recommended — it causes degraded special token prediction (9% WER).
+Measured on Ryzen AI 7 PRO 350 (WSL/Linux, ORT 1.22). Lower is better for both WER and RTF.
 
 ### GPU Benchmarks (11s JFK audio, 0.6B int4)
 
