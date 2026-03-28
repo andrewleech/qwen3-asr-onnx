@@ -1,4 +1,37 @@
 
+### [107] FP16 weight-only encoder — storage-only precision reduction
+**Date:** 2026-03-29
+**Idea:** The existing FP16 encoder (from `convert_fp16.py` using `onnxconverter_common`) rewrites the entire compute graph to FP16 intermediate types with Cast nodes, which was previously found to degrade quality. Test a different approach: convert only the initializer weight tensors to FP16 storage while preserving FP32 graph structure. Insert explicit `Cast(FP16→FP32)` nodes after each converted initializer so all ops still receive FP32 inputs. This should be numerically identical to FP32 (all compute in FP32) with half the file size — the same principle as FP16 embed_tokens.
+
+**Change:** Created `convert_weights_fp16.py` which:
+1. Converts 307 FP32 initializer tensors to FP16 (20 non-FP32 tensors skipped)
+2. Renames each initializer `X` → `X__fp16`
+3. Inserts `Cast(FP16→FP32)` node: `X__fp16` → `X` so all consuming ops still get FP32
+4. Saves with weights inlined (encoder is < 2 GB)
+
+File size: 752 MB → 376 MB (50% reduction).
+
+One tensor `val_89` (scalar, value `-3.4e38` = negative FP32 max) overflows FP16 range (max ±65,504). This is the attention mask fill value used by the windowed attention layers — multiplied with the attention mask to produce large negative values that softmax maps to zero. In FP16 it becomes `-inf`, then Cast back to FP32 produces `-inf` (FP32).
+
+**Result (200-sample LibriSpeech test-other, 0.6B int4 decoders, Python evaluate_wer.py):**
+| Trial | Encoder | WER | RTF | File size |
+|---|---|---|---|---|
+| Baseline | FP32 (717 MB) | 5.16% | 0.25x | 717 MB |
+| FP16 weight-only + Cast | FP16 storage (376 MB) | **100.00%** | 1.50x | 376 MB |
+
+**Outcome:** CATASTROPHIC — the FP16 weight-only encoder produces completely empty output on every sample.
+
+**Analysis:**
+- The `-inf` attention mask is the likely cause. While `softmax(-inf) = 0` is mathematically correct, ORT's windowed attention implementation may propagate `-inf` through intermediate computations (e.g. `Mul` with the mask tensor) producing `NaN` or unexpected results that corrupt encoder features.
+- The 6× slowdown (0.25x → 1.50x RTF) confirms the 307 Cast nodes add overhead. ORT cannot fuse FP16 initializers with FP32 ops, so each weight load requires an explicit cast.
+- This approach is fundamentally incompatible with the encoder's use of extreme FP32 values for attention masking. The original model's BF16 weights work because BF16 has the same exponent range as FP32 (8 exponent bits, range ±3.4e38). FP16 has only 5 exponent bits (range ±65,504).
+
+**Conclusion:** The encoder must remain FP32 for distribution. No FP16 variant (graph-level or weight-only) is viable due to the attention mask range requirement. This is not a quantization quality tradeoff — it is a hard numerical failure.
+
+**Future options:**
+- Export the encoder with a smaller mask constant (e.g. `-65504` instead of `-3.4e38`) at the PyTorch level, then FP16 would work. Requires changes to the export script.
+- BF16 ONNX support in ORT would allow half-size storage with FP32-equivalent range, but BF16 support is limited to specific EPs.
+
 ### [104] INT4 encoder and FP16 embed_tokens — 0.6B package size reduction
 **Date:** 2026-03-19
 **Idea:** The 0.6B int4 package is ~2.6 GB, larger than the original BF16 safetensors (~1.2 GB). The FP32 encoder (717 MB) and FP32 embed_tokens.bin (594 MB) account for 1.3 GB. Test whether INT4 encoder (MatMulNBits, RTN, block_size=64, accuracy_level=4) and FP16 embed_tokens preserve quality while reducing package size.
