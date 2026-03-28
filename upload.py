@@ -61,7 +61,7 @@ INT4_SECTION = """\
 
 | File | Description |
 |---|---|
-| `encoder.int4.onnx` | Encoder (FP32 weights, same quality as `encoder.onnx`) |
+| `encoder.int4.onnx` | Encoder (native FP16 via autocast export, FP32 I/O, half the size of FP32) |
 | `decoder_init.int4.onnx` | int4 decoder prefill |
 | `decoder_init.int4.onnx.data` | Weights for int4 decoder_init |
 | `decoder_step.int4.onnx` | int4 decoder step |

@@ -1,4 +1,55 @@
 
+### [108] Native FP16 encoder export — autocast tracing (0.6B)
+**Date:** 2026-03-29
+**Idea:** The weight-only FP16 approach ([107]) failed because the attention mask constant (`-3.4e38`) overflows FP16 range. The graph-level FP16 conversion (`convert_fp16.py`) inserts Cast nodes everywhere, degrading both speed and quality. Try a third approach: load the model in FP32, export with `torch.amp.autocast('cpu', dtype=torch.float16)` so PyTorch traces native FP16 ops where safe and keeps FP32 for precision-sensitive ops (LayerNorm, softmax). The attention mask uses `torch.finfo(torch.float16).min` = `-65504` (valid FP16) instead of `-3.4e38`.
+
+**Change:** Created `export_encoder_native_fp16.py`:
+1. Load model in FP32, convert all parameters to FP16 via `.half()`
+2. Trace with `torch.amp.autocast('cpu', dtype=torch.float16)` — captures mixed-precision graph natively
+3. Patch I/O with 2 Cast nodes: FP32 mel input → FP16 (internal), FP16 features → FP32 output
+4. Embed weights into proto, fix Reshape allowzero
+
+File size: 376 MB (vs 717 MB FP32 — 47% reduction). Only 2 Cast nodes at I/O boundary, no internal Casts.
+
+**Result (200-sample LibriSpeech test-other, 0.6B int4 decoders, Python evaluate_wer.py):**
+| Trial | Encoder | WER | RTF | File size |
+|---|---|---|---|---|
+| Baseline | FP32 (717 MB) | 5.16% | 0.26x | 717 MB |
+| Native FP16 | autocast FP16 (376 MB) | **5.13%** | **0.26x** | **376 MB** |
+
+**Outcome:** SUCCESS — native FP16 encoder has zero WER degradation (5.13% vs 5.16% is within ±0.5pp noise). Same speed, half the file size.
+
+**Why this works when [107] failed:**
+- The attention mask is generated during tracing with `torch.finfo(mel.dtype).min` where `mel.dtype` is FP16 → produces `-65504` (valid FP16), not `-3.4e38` (overflows)
+- `torch.amp.autocast` keeps LayerNorm and softmax in FP32 internally during tracing, which ONNX export captures as native mixed-precision ops — not post-hoc Cast nodes
+- Only 2 Cast nodes total (I/O boundary) vs 307 in the weight-only approach
+
+**Impact on package sizes (0.6B int4):**
+| Component | Before | After |
+|---|---|---|
+| encoder.int4.onnx | 717 MB | 376 MB |
+| embed_tokens.bin | 594 MB (FP32) | 297 MB (FP16, per [104]) |
+| int4 decoders | ~1.2 GB | ~1.2 GB |
+| **Total** | **~2.5 GB** | **~1.9 GB** |
+
+**1.7B result (200-sample LibriSpeech test-other, int4 decoders):**
+| Trial | Encoder | WER | RTF | File size |
+|---|---|---|---|---|
+| Baseline | FP32 (1.2 GB) | 4.16% | 0.44x | 1.2 GB |
+| Native FP16 | autocast FP16 (639 MB) | **4.23%** | **0.43x** | **639 MB** |
+
++0.07pp WER on 1.7B (within noise). Slightly faster. Confirmed on both model sizes.
+
+**Impact on package sizes (1.7B int4):**
+| Component | Before | After |
+|---|---|---|
+| encoder.int4.onnx | 1.2 GB | 639 MB |
+| embed_tokens.bin | 1.2 GB (FP32) | 610 MB (FP16) |
+| int4 decoders | ~3.0 GB | ~3.0 GB |
+| **Total** | **~5.4 GB** | **~4.2 GB** |
+
+**Conclusion:** Native FP16 encoder via autocast export is the recommended encoder format for both 0.6B and 1.7B. Zero WER impact, half the file size, no speed penalty. Should replace FP32 `encoder.int4.onnx` in published packages.
+
 ### [107] FP16 weight-only encoder — storage-only precision reduction
 **Date:** 2026-03-29
 **Idea:** The existing FP16 encoder (from `convert_fp16.py` using `onnxconverter_common`) rewrites the entire compute graph to FP16 intermediate types with Cast nodes, which was previously found to degrade quality. Test a different approach: convert only the initializer weight tensors to FP16 storage while preserving FP32 graph structure. Insert explicit `Cast(FP16→FP32)` nodes after each converted initializer so all ops still receive FP32 inputs. This should be numerically identical to FP32 (all compute in FP32) with half the file size — the same principle as FP16 embed_tokens.

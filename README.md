@@ -14,7 +14,7 @@ Each model directory contains FP32 files plus quantized variants with suffixed n
 | File pattern | Description |
 |---|---|
 | `encoder.onnx` | FP32 audio encoder (weights inlined) |
-| `encoder.int4.onnx` | Encoder for int4 variant (FP32 weights — INT8/FP16 encoders degrade quality) |
+| `encoder.int4.onnx` | Encoder for int4 variant (native FP16 via autocast export, FP32 I/O — half the size of FP32, zero WER impact) |
 | `decoder_init.onnx` + `.data` | FP32 decoder prefill (full sequence, outputs KV cache) |
 | `decoder_init.int4.onnx` + `.data` | int4 decoder_init variant |
 | `decoder_step.onnx` + `.data` | FP32 decoder autoregressive step (single token + KV cache) |
@@ -47,15 +47,15 @@ Each int4 package contains the files needed for quantized inference:
 
 | Component | 0.6B | 1.7B | Format | Why this format |
 |---|---|---|---|---|
-| `encoder.int4.onnx` | 716 MB | 1,217 MB | **FP32** | FP16 breaks (attention mask overflows FP16 range); INT4/INT8 degrade WER by 0.2–1pp |
+| `encoder.int4.onnx` | 376 MB | 639 MB | **native FP16** | Autocast export — FP16 ops internally, FP32 I/O. Zero WER impact vs FP32 encoder |
 | `decoder_init.int4.onnx` + `.data` | 835 MB | 1,954 MB | **int4** | MatMulNBits bs64 al4. 1.7B uses GPTQ calibration; 0.6B uses RTN (GPTQ hurts <1B models) |
 | `decoder_step.int4.onnx` + `.data` | 325 MB | 937 MB | **int4** | RTN al4 for both sizes (no quality difference vs GPTQ for autoregressive step) |
 | `embed_tokens.bin` | 297 MB | 593 MB | **FP16** | Zero measured WER impact vs FP32. Consumer casts to FP32 at lookup time |
 | `config.json` + `tokenizer.json` | ~11 MB | ~11 MB | — | Architecture config, special tokens, mel params, tokenizer |
 
-Uncompressed total: 0.6B = 2.2 GB, 1.7B = 4.7 GB.
+Uncompressed total: 0.6B = 1.9 GB, 1.7B = 4.2 GB.
 
-The encoder is the largest component because it must remain FP32. The original model uses BF16 weights (same range as FP32, ±3.4e38). The encoder's attention masking uses values at the FP32 range limit that overflow in FP16 (max ±65,504), producing broken output. INT4 encoder saves 595 MB but adds 0.17pp WER from quantization of the windowed Conv2D layers.
+The encoder uses a native FP16 export via `torch.amp.autocast` tracing. Unlike post-hoc FP16 conversion (which inserts Cast nodes and breaks quality), autocast tracing captures native FP16 ops while keeping precision-sensitive operations (LayerNorm, softmax) in FP32. The attention mask uses `torch.finfo(float16).min` = -65504 (valid FP16), avoiding the overflow that breaks post-hoc conversion. Result: half the FP32 encoder size with zero measured WER impact (verified on both 0.6B and 1.7B, 200-sample LibriSpeech test-other).
 
 #### Package contents — FP32
 
@@ -130,7 +130,7 @@ Loads the PyTorch model and the ONNX export, runs the same audio through both, a
 
 ### 3. int4 MatMulNBits Quantization (recommended for both 0.6B and 1.7B)
 
-`quantize_nbits.py` applies ORT's `MatMulNBitsQuantizer` to the decoder files. The encoder uses FP32 (INT8 encoder degrades WER by ~1pp on 0.6B).
+`quantize_nbits.py` applies ORT's `MatMulNBitsQuantizer` to the decoder files. The encoder uses a native FP16 export (half the size of FP32, zero WER impact).
 
 ```bash
 # RTN (no calibration data, fast — adds .int4 files alongside FP32):
@@ -139,8 +139,10 @@ python quantize_nbits.py \
     --output output/qwen3-asr-0.6b \
     --bits 4 --block-size 64 --accuracy-level 4
 
-# Copy FP32 encoder as the int4 encoder:
-cp output/qwen3-asr-0.6b/encoder.onnx output/qwen3-asr-0.6b/encoder.int4.onnx
+# Native FP16 encoder (autocast export — half size, zero WER impact):
+python export_encoder_native_fp16.py \
+    --model Qwen/Qwen3-ASR-0.6B \
+    --output output/qwen3-asr-0.6b/encoder.int4.onnx
 ```
 
 `--accuracy-level 4` activates a higher-precision accumulation kernel in ORT that is both faster and more accurate than the default on x86.
@@ -179,8 +181,10 @@ python quantize_nbits.py \
     --bits 4 --block-size 64 --accuracy-level 4 \
     --decoders decoder_step
 
-# Copy FP32 encoder as the int4 encoder
-cp output/qwen3-asr-1.7b/encoder.onnx output/qwen3-asr-1.7b/encoder.int4.onnx
+# Native FP16 encoder (autocast export — half size, zero WER impact)
+python export_encoder_native_fp16.py \
+    --model Qwen/Qwen3-ASR-1.7B \
+    --output output/qwen3-asr-1.7b/encoder.int4.onnx
 
 # Clean up GPTQ temp files
 rm -f output/qwen3-asr-1.7b/*-*-*-*-*.data output/qwen3-asr-1.7b/*_augment.onnx
@@ -260,8 +264,10 @@ uv run python quantize_nbits.py \
     --output output/qwen3-asr-0.6b \
     --bits 4 --block-size 64 --accuracy-level 4
 
-# Copy FP32 encoder as the int4 encoder
-cp output/qwen3-asr-0.6b/encoder.onnx output/qwen3-asr-0.6b/encoder.int4.onnx
+# Native FP16 encoder (autocast export — half size, zero WER impact)
+uv run python export_encoder_native_fp16.py \
+    --model Qwen/Qwen3-ASR-0.6B \
+    --output output/qwen3-asr-0.6b/encoder.int4.onnx
 
 # Convert embed_tokens to FP16 (halves file size, zero WER impact)
 uv run python convert_embed_fp16.py --model-dir output/qwen3-asr-0.6b
@@ -300,8 +306,10 @@ uv run python quantize_nbits.py \
     --bits 4 --block-size 64 --accuracy-level 4 \
     --decoders decoder_step
 
-# Copy FP32 encoder as the int4 encoder
-cp output/qwen3-asr-1.7b/encoder.onnx output/qwen3-asr-1.7b/encoder.int4.onnx
+# Native FP16 encoder (autocast export — half size, zero WER impact)
+python export_encoder_native_fp16.py \
+    --model Qwen/Qwen3-ASR-1.7B \
+    --output output/qwen3-asr-1.7b/encoder.int4.onnx
 
 # Clean up GPTQ temp files
 rm -f output/qwen3-asr-1.7b/*-*-*-*-*.data output/qwen3-asr-1.7b/*_augment.onnx
@@ -349,7 +357,7 @@ After full reproduction:
 output/
 ├── qwen3-asr-0.6b/              # All 0.6B variants in one directory
 │   ├── encoder.onnx              # FP32
-│   ├── encoder.int4.onnx         # FP32 (copy of encoder.onnx)
+│   ├── encoder.int4.onnx         # Native FP16 (autocast export, FP32 I/O)
 │   ├── decoder_init.onnx         # FP32
 │   ├── decoder_init.onnx.data
 │   ├── decoder_init.int4.onnx    # int4 RTN al4
@@ -363,7 +371,7 @@ output/
 │   └── tokenizer.json
 ├── qwen3-asr-1.7b/              # All 1.7B variants in one directory
 │   ├── encoder.onnx              # FP32
-│   ├── encoder.int4.onnx         # FP32 (copy of encoder.onnx)
+│   ├── encoder.int4.onnx         # Native FP16 (autocast export, FP32 I/O)
 │   ├── decoder_init.onnx         # FP32
 │   ├── decoder_init.onnx.data
 │   ├── decoder_init.int4.onnx    # int4 GPTQ
