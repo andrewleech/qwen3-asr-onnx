@@ -1,4 +1,34 @@
 
+### [114] Selective layer exclusion from INT4 — first/last layer + lm_head at FP32
+**Date:** 2026-03-30
+**Idea:** The Qwen3 quantization study (arxiv 2505.02214) and TuneQn framework suggest that first and last decoder layers plus lm_head are most sensitive to quantization. Test excluding these from INT4 using ORT's `nodes_to_exclude` parameter. 15 of 197 MatMul nodes excluded (~8%): layer 0 (node_linear through node_linear_6), layer 27 (node_linear_189-195), lm_head (node_linear_196).
+
+**Change:** Added `--nodes-to-exclude` parameter to `quantize_nbits.py`. Quantized both decoders with the 15-node exclusion list.
+
+**Result (200-sample LibriSpeech test-other, 0.6B, WSL/Linux):**
+| Trial | WER | RTF | Size |
+|---|---|---|---|
+| Baseline int4 | 5.16% | 0.28x | baseline |
+| L0+L27+lm_head FP32 | **4.96%** | 0.35x | +9% |
+
+**Outcome:** MIXED — 0.20pp WER improvement but 25% speed regression and a new failure mode.
+
+**Details:**
+- WER drops from 5.16% → 4.96% (-0.20pp). Consistent improvement tracked through all 200 samples.
+- RTF regresses from 0.28x → 0.35x. The 15 FP32 MatMul nodes (2 full layers + lm_head) are slower than their int4 equivalents.
+- New failure mode: 3 samples (46, 83, 102) produced "ology" — degenerate single-token output on short utterances ("nonsense", "so shall we yet sir", "no wait"). This didn't occur in the baseline. The FP32 first/last layers may shift the decoder's logit distribution enough to trigger early EOS on very short inputs.
+
+**Analysis:**
+- The 0.20pp WER gain is real and demonstrates that first/last layers are indeed sensitive to int4 quantization in this model.
+- The 25% speed regression makes this impractical for the recommended configuration. The speed loss outweighs the WER gain for a model positioned as "matching Parakeet speed."
+- The "ology" failure mode suggests the mixed FP32/int4 decoder has a distribution mismatch at boundaries between quantized and unquantized layers.
+- A per-layer sensitivity profile (rather than heuristic first/last selection) might identify a better subset of layers to exclude with less speed impact. Excluding only the most sensitive 2-3 projections within a layer (rather than all 7) could reduce the speed penalty while retaining most of the WER benefit.
+
+**Future directions:**
+- Test excluding only attention projections (q,k,v,o) in layer 0 — 4 nodes instead of 7, targeting the most sensitive ops.
+- Per-layer QDQ sensitivity profiling to find the actual most-sensitive layers (might not be first/last).
+- Test on 1.7B where the model has more capacity and selective exclusion may have lower relative speed cost.
+
 ### [113] RMSNorm fusion before int4 quantization — fuse-then-quantize pipeline
 **Date:** 2026-03-30
 **Idea:** Experiment [111] applied SimplifiedLayerNormalization fusion *after* int4 quantization and observed +0.59pp WER on 10 samples. Hypothesis: the regression was because int4 weights were calibrated against the decomposed RMSNorm path, then the norm implementation changed. If fusion is applied to the FP32 graph *before* quantization, the int4 weights are calibrated against the fused kernel from the start — no mismatch.
