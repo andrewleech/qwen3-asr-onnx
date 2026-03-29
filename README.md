@@ -111,7 +111,7 @@ uv sync
 
 ## Pipeline
 
-The export pipeline has three stages. Each stage is a standalone script. Quantized files are written into the same directory as the FP32 source using suffixed filenames.
+The export pipeline has four stages. Each stage is a standalone script. Quantized files are written into the same directory as the FP32 source using suffixed filenames.
 
 ### 1. Export (FP32 ONNX)
 
@@ -132,7 +132,16 @@ python validate.py --onnx-dir output/qwen3-asr-0.6b --audio tests/fixtures/test_
 
 Loads the PyTorch model and the ONNX export, runs the same audio through both, and compares encoder features and decoded tokens. Expects exact token-for-token match.
 
-### 3. int4 MatMulNBits Quantization (recommended for both 0.6B and 1.7B)
+### 3. Optimize Decoders (RMSNorm fusion)
+
+```bash
+python optimize_decoders.py --input output/qwen3-asr-0.6b
+python optimize_decoders.py --input output/qwen3-asr-1.7b
+```
+
+Fuses decomposed RMSNorm into `SimplifiedLayerNormalization` (4% speedup, zero WER impact). Must be applied to FP32 graphs before quantization so that int4 weights are calibrated against the fused kernel (see experiment [113]). The encoder does not benefit from this optimization.
+
+### 4. int4 MatMulNBits Quantization (recommended for both 0.6B and 1.7B)
 
 `quantize_nbits.py` applies ORT's `MatMulNBitsQuantizer` to the decoder files. The encoder uses a native FP16 export (half the size of FP32, zero WER impact).
 
@@ -151,13 +160,13 @@ cp output/qwen3-asr-0.6b/encoder.onnx output/qwen3-asr-0.6b/encoder.int4.onnx
 
 For 1.7B, use native FP16 encoder instead (size savings outweighs the small overhead at that scale).
 
-GPTQ calibration is also supported but provides no WER benefit over RTN (see section 4).
+GPTQ calibration is also supported but provides no WER benefit over RTN (see section 5).
 
-### 4. GPTQ Calibration (optional, not recommended)
+### 5. GPTQ Calibration (optional, not recommended)
 
-GPTQ calibration via `collect_gptq_calib.py` + `quantize_nbits.py --algo gptq` is supported for experimentation, but testing showed no WER benefit over RTN for either model size (experiment [109]). RTN-only quantization (section 3) is recommended for both 0.6B and 1.7B.
+GPTQ calibration via `collect_gptq_calib.py` + `quantize_nbits.py --algo gptq` is supported for experimentation, but testing showed no WER benefit over RTN for either model size (experiment [109]). RTN-only quantization (section 4) is recommended for both 0.6B and 1.7B.
 
-### 5. AWQ Smooth + Quantize (INT8, optional for 0.6B)
+### 6. AWQ Smooth + Quantize (INT8, optional for 0.6B)
 
 INT8 AWQ is not published to HuggingFace but can be built locally for a smaller-footprint variant (1.1 GB, 5.21% WER).
 
@@ -218,6 +227,9 @@ uv run python validate.py \
     --onnx-dir output/qwen3-asr-0.6b \
     --audio tests/fixtures/test_audio.wav
 
+# Optimize decoders (fuses RMSNorm -> SimplifiedLayerNormalization, 4% speedup)
+uv run python optimize_decoders.py --input output/qwen3-asr-0.6b
+
 # int4 RTN al4 decoders (recommended)
 uv run python quantize_nbits.py \
     --input output/qwen3-asr-0.6b \
@@ -241,6 +253,9 @@ uv run python export.py --model Qwen/Qwen3-ASR-1.7B
 uv run python validate.py \
     --onnx-dir output/qwen3-asr-1.7b \
     --audio tests/fixtures/test_audio.wav
+
+# Optimize decoders (fuses RMSNorm -> SimplifiedLayerNormalization, 4% speedup)
+uv run python optimize_decoders.py --input output/qwen3-asr-1.7b
 
 # int4 RTN al4 decoders (same as 0.6B — GPTQ provides no WER benefit, see experiment [109])
 uv run python quantize_nbits.py \
