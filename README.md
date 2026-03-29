@@ -37,8 +37,8 @@ Multiple quantization variants coexist in a single directory. The consumer selec
 
 | Model | Variant | WER | RTF (CPU) | tar.gz download |
 |---|---|---|---|---|
-| **0.6B** | int4 RTN al4 | 5.16% | 0.16x | 1.2 GB |
-| **1.7B** | int4 RTN al4 | 4.20% | 0.37x | 2.5 GB |
+| **0.6B** | int4 RTN al4 | 5.16% | 0.18x | 1.2 GB |
+| **1.7B** | int4 RTN al4 | 4.20% | 0.32x | 2.5 GB |
 | Parakeet-TDT 0.6B INT8 | reference | 5.45% | 0.16x | — |
 
 WER measured on LibriSpeech test-other (200 samples). RTF < 1.0 = faster than real-time.
@@ -80,19 +80,19 @@ The two decoder protos (~2 MB each) reference offsets in the single shared `deco
 | Engine | WER | RTF (11s) | RTF (35s) |
 |---|---|---|---|
 | 1.7B FP32 | 3.79% | ~0.70x | ~0.70x |
-| 1.7B int4 RTN al4 | 4.20% | 0.37x | 0.37x |
+| 1.7B int4 RTN al4 | 4.20% | 0.32x | — |
 | 0.6B FP32 | 4.42% | 0.29x | 0.32x |
-| **0.6B int4 RTN al4** | **5.16%** | **0.16x** | — |
+| **0.6B int4 RTN al4** | **5.16%** | **0.18x** | — |
 | 0.6B AWQ INT8 α=0.2 | 5.21% | 0.14x | 0.17x |
 | Parakeet-TDT 0.6B INT8 | 5.45% | 0.16x | 0.13x |
 
-Measured on Ryzen AI 7 PRO 350 (WSL/Linux, ORT 1.22). Lower is better for both WER and RTF.
+RTF measured on Ryzen AI 7 PRO 350 (native Windows, ORT 2.0 rc12). WER from 200-sample LibriSpeech test-other. Lower is better for both.
 
 ### GPU Benchmarks (11s JFK audio, 0.6B int4)
 
 | Host | CPU | DirectML | WebGPU |
 |---|---|---|---|
-| anl (Ryzen AI 7 PRO 350, Radeon 860M iGPU) | **1.77s** (0.16x) | 19.9s (garbage output) | 5.16s (0.47x) |
+| anl (Ryzen AI 7 PRO 350, Radeon 860M iGPU) | **2.03s** (0.18x) | 19.9s (garbage output) | 5.16s (0.47x) |
 | step (Ryzen 9 3900X, GTX 1650 SUPER 4 GB) | 2.42s (0.22x) | 2.25s (0.20x) | **1.83s** (0.17x) |
 
 - **NVIDIA (GTX 1650 SUPER):** WebGPU gives 24% speedup over CPU (1.83s vs 2.42s). DirectML works correctly with 7% speedup. All outputs correct.
