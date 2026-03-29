@@ -11,14 +11,21 @@
 
 **Outcome:** CONFIRMED REGRESSION — FP16 encoder is 8.7% slower per inference (0.162s, repeatable with no distribution overlap). Loads 5% faster (smaller file). The Cast nodes at the I/O boundary prevent ORT from fusing ops across the FP16/FP32 boundary.
 
-**Decision:**
-- **0.6B:** Revert to FP32 encoder. 359 MB size increase is acceptable in a ~2 GB package. Speed matters more for Handy's PTT use case.
-- **1.7B:** Keep native FP16 encoder. The 1.7B package is larger (3.3 GB) so the 609 MB savings is more impactful, and the 1.7B already got faster from the GPTQ→RTN switch (0.37x→0.32x).
+**1.7B result (10 runs each):**
+| Encoder | Load | Mean | Min | Max | RTF |
+|---|---|---|---|---|---|
+| FP32 (1.2 GB) | 12.8s | **3.179s** | 3.152s | 3.200s | **0.29x** |
+| Native FP16 (609 MB) | 15.1s | **3.606s** | 3.418s | 3.968s | **0.33x** |
+
+FP16 is 13.4% slower on 1.7B with higher variance (±0.25s vs ±0.02s). FP16 also loads slower on 1.7B (opposite of 0.6B).
+
+**Decision:** Revert both model sizes to FP32 encoder. The native FP16 encoder export remains available via `export_encoder_native_fp16.py` for GPU targets where FP16 compute is native, but for CPU inference FP32 is faster.
 
 **Notes:**
-- The regression is from per-inference Cast overhead, not load-time. ORT's graph optimizer cannot fuse operators across dtype boundaries.
-- FP32 encoder compresses well in tar.gz (~350 MB compressed), so the download size impact is minimal.
+- The regression is from per-inference Cast overhead. ORT's graph optimizer cannot fuse operators across dtype boundaries.
+- FP32 encoder compresses well in tar.gz (~350 MB / ~600 MB compressed), so the download size impact is minimal.
 - A future ORT version with better mixed-precision fusion could eliminate this overhead.
+- The native FP16 export is still valuable for GPU EPs (DirectML, WebGPU) where FP16 compute is native and Cast nodes are free.
 
 ### [109] Int4 decoder weight sharing — share_weights.py on quantized models
 **Date:** 2026-03-29
