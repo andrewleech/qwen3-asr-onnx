@@ -12,6 +12,9 @@ Applies offline graph fusions that ORT's runtime optimizer does not perform:
 Must be applied to FP32 graphs before int4 quantization so that weights are calibrated
 against the fused kernels ([113]).
 
+Note: This script overwrites the original ONNX files in-place. If interrupted mid-save,
+the original file may be lost. Back up models before running on irreplaceable files.
+
 Usage:
     uv run python optimize_graphs.py --input output/qwen3-asr-0.6b
     uv run python optimize_graphs.py --input output/qwen3-asr-1.7b
@@ -25,38 +28,24 @@ import onnx
 from onnxruntime.transformers.optimizer import optimize_model
 
 
+PROTOBUF_LIMIT = 2 * 1024**3  # 2 GB
+
+
 def load_config(model_dir: str) -> dict:
     """Read config.json."""
     config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"config.json not found in {model_dir}")
     with open(config_path) as f:
         return json.load(f)
 
 
-def fix_external_data_refs(onnx_path: str) -> None:
-    """Fix external data location references after optimize_model saves.
-
-    The optimizer saves with a temp filename as the external data location.
-    This rewrites all references to point to the actual .onnx.data file.
-    """
-    basename = os.path.basename(onnx_path)
-    expected_data_name = f"{basename}.data"
-
-    model = onnx.load(onnx_path, load_external_data=False)
-    fixed = 0
-    for tensor in model.graph.initializer:
-        for entry in tensor.external_data:
-            if entry.key == "location" and entry.value != expected_data_name:
-                entry.value = expected_data_name
-                fixed += 1
-    if fixed > 0:
-        with open(onnx_path, "wb") as f:
-            f.write(model.SerializeToString())
-        print(f"  Fixed {fixed} external data references -> {expected_data_name}")
-
-
 def optimize_graph(onnx_path: str, num_heads: int, hidden_size: int,
                    use_external_data: bool = True) -> None:
-    """Run ORT transformer optimizer on a single ONNX file."""
+    """Run ORT transformer optimizer on a single ONNX file.
+
+    Skips save if no fusions were applied (avoids unnecessary multi-GB rewrites).
+    """
     basename = os.path.basename(onnx_path)
     print(f"\nOptimizing {basename}...")
 
@@ -74,28 +63,30 @@ def optimize_graph(onnx_path: str, num_heads: int, hidden_size: int,
         opt_level=1,
     )
 
-    # Report fusions
+    # Check fusions
     fusions = model.get_fused_operator_statistics()
-    if fusions:
-        print("  Fusions applied:")
-        for op_type, count in sorted(fusions.items()):
-            if count > 0:
-                print(f"    {op_type}: {count}")
-    else:
-        print("  No fusions applied")
+    applied = {op: count for op, count in (fusions or {}).items() if count > 0}
 
-    # Save back (overwrite original)
+    if not applied:
+        print("  No fusions applied, skipping save")
+        return
+
+    print("  Fusions applied:")
+    for op_type, count in sorted(applied.items()):
+        print(f"    {op_type}: {count}")
+
+    # Check protobuf size limit for inlined models
+    if not use_external_data:
+        estimated_size = model.model.ByteSize()
+        if estimated_size > PROTOBUF_LIMIT * 0.85:
+            print(f"  WARNING: Model size {estimated_size / 1024**3:.2f} GB "
+                  f"is close to 2 GB protobuf limit. Consider external data.")
+
+    # Save back (overwrites original)
     model.save_model_to_file(onnx_path, use_external_data_format=use_external_data)
 
-    # Fix external data references if using external data
-    if use_external_data:
-        fix_external_data_refs(onnx_path)
-
-    # Count nodes after
-    model_proto = onnx.load(onnx_path, load_external_data=False)
-    nodes_after = len(model_proto.graph.node)
-    del model_proto
-
+    # Report node reduction (use optimizer's in-memory model, avoid extra disk load)
+    nodes_after = len(model.model.graph.node)
     reduction = nodes_before - nodes_after
     pct = (reduction / nodes_before * 100) if nodes_before > 0 else 0
     print(f"  Nodes: {nodes_before} -> {nodes_after} ({reduction} removed, {pct:.1f}% reduction)")
@@ -124,34 +115,39 @@ def main():
 
     model_dir = args.input
     config = load_config(model_dir)
-    decoder_cfg = config["decoder"]
-    encoder_cfg = config["encoder"]
-
-    dec_heads = decoder_cfg["num_attention_heads"]
-    dec_hidden = decoder_cfg["hidden_size"]
-    enc_heads = encoder_cfg["num_heads"]
-    enc_hidden = encoder_cfg["hidden_size"]
-
-    print(f"Decoder config: num_heads={dec_heads}, hidden_size={dec_hidden}")
-    print(f"Encoder config: num_heads={enc_heads}, hidden_size={enc_hidden}")
 
     # Optimize encoder (SkipLayerNormalization + BiasGelu fusions)
     if not args.skip_encoder:
-        enc_path = os.path.join(model_dir, "encoder.onnx")
-        if os.path.exists(enc_path):
-            # Encoder weights are inlined (no external data)
-            optimize_graph(enc_path, enc_heads, enc_hidden, use_external_data=False)
+        encoder_cfg = config.get("encoder")
+        if encoder_cfg is None:
+            print("No encoder config in config.json, skipping encoder")
         else:
-            print(f"\nSkipping encoder.onnx (not found)")
+            enc_heads = encoder_cfg["num_heads"]
+            enc_hidden = encoder_cfg["hidden_size"]
+            print(f"Encoder config: num_heads={enc_heads}, hidden_size={enc_hidden}")
+
+            enc_path = os.path.join(model_dir, "encoder.onnx")
+            if os.path.exists(enc_path):
+                optimize_graph(enc_path, enc_heads, enc_hidden, use_external_data=False)
+            else:
+                print(f"\nSkipping encoder.onnx (not found)")
 
     # Optimize decoders (SimplifiedLayerNormalization fusion)
     if not args.skip_decoders:
-        for decoder_name in ["decoder_init", "decoder_step"]:
-            dec_path = os.path.join(model_dir, f"{decoder_name}.onnx")
-            if os.path.exists(dec_path):
-                optimize_graph(dec_path, dec_heads, dec_hidden, use_external_data=True)
-            else:
-                print(f"\nSkipping {decoder_name}.onnx (not found)")
+        decoder_cfg = config.get("decoder")
+        if decoder_cfg is None:
+            print("No decoder config in config.json, skipping decoders")
+        else:
+            dec_heads = decoder_cfg["num_attention_heads"]
+            dec_hidden = decoder_cfg["hidden_size"]
+            print(f"Decoder config: num_heads={dec_heads}, hidden_size={dec_hidden}")
+
+            for decoder_name in ["decoder_init", "decoder_step"]:
+                dec_path = os.path.join(model_dir, f"{decoder_name}.onnx")
+                if os.path.exists(dec_path):
+                    optimize_graph(dec_path, dec_heads, dec_hidden, use_external_data=True)
+                else:
+                    print(f"\nSkipping {decoder_name}.onnx (not found)")
 
     print("\nDone.")
 
