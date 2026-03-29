@@ -50,9 +50,8 @@ ONNX export of [{base_model}](https://huggingface.co/{base_model}) for use with 
 |---|---|
 | `encoder.onnx` | Audio encoder — mel spectrogram to features (weights inlined) |
 | `decoder_init.onnx` | Decoder prefill — accepts `input_ids`, outputs logits + KV cache |
-| `decoder_init.onnx.data` | External weights for FP32 decoder_init |
 | `decoder_step.onnx` | Decoder autoregressive step — accepts `input_embeds` + KV cache |
-| `decoder_step.onnx.data` | External weights for FP32 decoder_step |
+| `decoder_weights.data` | Shared external weights for both FP32 decoders (loaded once) |
 """
 
 INT4_SECTION = """\

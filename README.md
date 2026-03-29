@@ -15,15 +15,16 @@ Each model directory contains FP32 files plus quantized variants with suffixed n
 |---|---|
 | `encoder.onnx` | FP32 audio encoder (weights inlined) |
 | `encoder.int4.onnx` | Encoder for int4 variant (native FP16 via autocast export, FP32 I/O — half the size of FP32, zero WER impact) |
-| `decoder_init.onnx` + `.data` | FP32 decoder prefill (full sequence, outputs KV cache) |
+| `decoder_init.onnx` | FP32 decoder prefill (full sequence, outputs KV cache) |
+| `decoder_step.onnx` | FP32 decoder autoregressive step (single token + KV cache) |
+| `decoder_weights.data` | Shared external weights for both FP32 decoders |
 | `decoder_init.int4.onnx` + `.data` | int4 decoder_init variant |
-| `decoder_step.onnx` + `.data` | FP32 decoder autoregressive step (single token + KV cache) |
 | `decoder_step.int4.onnx` + `.data` | int4 decoder_step variant |
 | `embed_tokens.bin` | Token embedding matrix `[vocab_size, hidden_size]`, FP16 (see below and `embed_tokens_dtype` in config.json) |
 | `tokenizer.json` | HuggingFace tokenizer |
 | `config.json` | Architecture config + special tokens + mel params |
 
-The decoder `.onnx` files are small graph protos (~2 MB each) with weights in separate `.data` files. Encoder weights are always inlined.
+The FP32 decoder `.onnx` files are small graph protos (~2 MB each) referencing a single shared `decoder_weights.data` file. ORT memory-maps this file once. int4 decoders have separate `.data` files per model. Encoder weights are always inlined.
 
 **Why `embed_tokens.bin` exists separately:** The two decoder models use different input strategies. `decoder_init` (prefill) accepts `input_ids` and has the embedding table built into its ONNX graph — this allows it to handle the audio feature scatter internally. `decoder_step` (autoregressive) accepts pre-looked-up `input_embeds` instead, keeping the embedding table out of its graph. The consumer loads `embed_tokens.bin` once at startup and performs the embedding lookup per token before calling `decoder_step`. This avoids duplicating the embedding weights across both decoder files while keeping `decoder_step` small for fast loading.
 
@@ -64,12 +65,13 @@ FP32 packages contain unquantized models for maximum accuracy:
 | Component | 0.6B | 1.7B | Format |
 |---|---|---|---|
 | `encoder.onnx` | 716 MB | 1,217 MB | FP32 |
-| `decoder_init.onnx` + `.data` | 2,275 MB | 6,565 MB | FP32 |
-| `decoder_step.onnx` + `.data` | 2,275 MB | 6,565 MB | FP32 |
+| `decoder_init.onnx` | ~2 MB | ~2 MB | FP32 (graph proto) |
+| `decoder_step.onnx` | ~2 MB | ~2 MB | FP32 (graph proto) |
+| `decoder_weights.data` | 2,273 MB | 6,563 MB | Shared external weights (loaded once) |
 | `embed_tokens.bin` | 297 MB | 593 MB | FP16 |
 | `config.json` + `tokenizer.json` | ~11 MB | ~11 MB | — |
 
-tar.gz download: 0.6B = 3.0 GB, 1.7B = 7.9 GB.
+The two decoder protos (~2 MB each) reference offsets in the single shared `decoder_weights.data` file. ORT memory-maps it once regardless of how many sessions use it.
 
 ### WER and Speed (LibriSpeech test-other, 200 samples, CPU)
 

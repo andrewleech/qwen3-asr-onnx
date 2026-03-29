@@ -31,9 +31,8 @@ ARCHIVES = [
         "files": [
             "encoder.onnx",
             "decoder_init.onnx",
-            "decoder_init.onnx.data",
             "decoder_step.onnx",
-            "decoder_step.onnx.data",
+            "decoder_weights.data",
         ],
     },
     {
@@ -55,9 +54,8 @@ ARCHIVES = [
         "files": [
             "encoder.onnx",
             "decoder_init.onnx",
-            "decoder_init.onnx.data",
             "decoder_step.onnx",
-            "decoder_step.onnx.data",
+            "decoder_weights.data",
         ],
     },
     {
