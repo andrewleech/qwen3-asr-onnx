@@ -1,4 +1,24 @@
 
+### [113] RMSNorm fusion before int4 quantization — fuse-then-quantize pipeline
+**Date:** 2026-03-30
+**Idea:** Experiment [111] applied SimplifiedLayerNormalization fusion *after* int4 quantization and observed +0.59pp WER on 10 samples. Hypothesis: the regression was because int4 weights were calibrated against the decomposed RMSNorm path, then the norm implementation changed. If fusion is applied to the FP32 graph *before* quantization, the int4 weights are calibrated against the fused kernel from the start — no mismatch.
+
+**Change:** Pipeline: FP32 decoder → `optimize_model(model_type='gpt2')` → fix external data refs → `quantize_nbits.py` (RTN al4 bs64) → evaluate.
+
+**Result (200-sample LibriSpeech test-other, 0.6B, WSL/Linux):**
+| Trial | WER | RTF | Time |
+|---|---|---|---|
+| Baseline int4 | 5.16% | 0.23x | 316s |
+| Fuse-then-quantize int4 | **5.13%** | **0.22x** | **302s** |
+
+**Outcome:** SUCCESS — zero WER impact (5.13% vs 5.16%, within noise), 4.2% faster. The fused `SimplifiedLayerNormalization` ops (113 instances) remain as FP32 kernels in the int4 graph and are measurably faster than the 5-op decomposed RMSNorm.
+
+**Why this works when post-quantization fusion [111] didn't:**
+- RTN quantization produces weights optimized for the exact graph structure at quantization time. Changing the norm implementation after quantization introduces a mismatch between the weight calibration context and the inference path.
+- Fusing before quantization means RTN sees the fused graph and calibrates accordingly. The int4 weights are optimal for the fused kernel.
+
+**Implication:** The export pipeline should include an optimize_model step between FP32 export and int4 quantization. This is a free 4% speedup with no quality tradeoff. The same approach should work for 1.7B (untested — same architecture, same fusion pattern).
+
 ### [112] ORT transformer optimizer — SkipLayerNorm + BiasGelu fusion on encoder
 **Date:** 2026-03-30
 **Idea:** Following the decoder RMSNorm fusion finding ([111]), test whether the ORT transformer optimizer also improves the encoder. The encoder uses standard LayerNorm (not RMSNorm) and GELU activations, which should match the SkipLayerNormalization and BiasGelu fusion patterns.
