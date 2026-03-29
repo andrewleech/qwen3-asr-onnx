@@ -1,4 +1,33 @@
 
+### [112] ORT transformer optimizer — SkipLayerNorm + BiasGelu fusion on encoder
+**Date:** 2026-03-30
+**Idea:** Following the decoder RMSNorm fusion finding ([111]), test whether the ORT transformer optimizer also improves the encoder. The encoder uses standard LayerNorm (not RMSNorm) and GELU activations, which should match the SkipLayerNormalization and BiasGelu fusion patterns.
+
+**Change:** Ran `optimize_model` with `model_type=gpt2`, `num_heads=14`, `hidden_size=896` on encoder.onnx. Both `gpt2` and `bert` model types produce identical results.
+
+**Fusions achieved (699 → 514 nodes, 26% reduction):**
+- SkipLayerNormalization: 35 (fused skip-connection + LayerNorm)
+- BiasGelu: 19 (fused bias + GELU activation)
+- Gelu: 3 (fused Erf-based GELU)
+- LayerNormalization: 37 → 2 (most folded into SkipLayerNorm)
+- No attention fusion (windowed attention pattern doesn't match any template)
+
+**Result (10-sample LibriSpeech test-other, WSL/Linux):**
+| Trial | Decoders | WER | RTF |
+|---|---|---|---|
+| Baseline FP32 | FP32 | 3.55% | 0.58x |
+| Encoder-fused FP32 | FP32 | 3.55% | 0.58x |
+| Baseline int4 | int4 | 5.92% | 0.27x |
+| Encoder-fused int4 | int4 | 5.92% | **0.26x** |
+
+**Outcome:** FINDING — token-exact output, marginal speedup with int4 decoders (~4%), no speedup with FP32 decoders.
+
+**Notes:**
+- ORT's runtime optimizer already fuses LayerNorm and GELU patterns on the encoder at load time. The offline transformer optimizer adds SkipLayerNorm fusion (skip-connection + norm in one op) which the runtime misses, but the benefit is small for the encoder.
+- With FP32 decoders, encoder time is a small fraction of total inference — the speedup is unmeasurable. With int4 decoders (faster), the encoder's share increases and the ~4% gain becomes visible.
+- File size increased slightly (717 → 746 MB) due to fused op attributes.
+- Safe to adopt for distribution if the encoder file size increase (~30 MB) is acceptable. Not high priority — the speedup is marginal.
+
 ### [111] ORT transformer optimizer — SimplifiedLayerNormalization fusion on decoders
 **Date:** 2026-03-30
 **Idea:** ORT's runtime optimizer does NOT fuse the decomposed RMSNorm pattern (ReduceMean → Pow → Add → Sqrt/Reciprocal → Mul, 113 instances × 5 ops = 565 ops) into `SimplifiedLayerNormalization`. The ORT transformer optimizer (`optimize_model` with `model_type=gpt2`) does fuse these, reducing node count by ~30% (2266 → 1586). Test whether pre-optimizing the decoder graphs improves inference speed. Also test if the GQA attention pattern (16Q/8KV heads, MRoPE) fuses.

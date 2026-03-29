@@ -78,6 +78,7 @@ def quantize_decoder(
     accuracy_level: int | None,
     algo: str,
     calib_data_path: str | None,
+    nodes_to_exclude: list[str] | None = None,
 ) -> None:
     """Quantize a single decoder ONNX file with MatMulNBits."""
     print(f"  Loading {os.path.basename(input_path)} ...")
@@ -118,6 +119,7 @@ def quantize_decoder(
             is_symmetric=False,
             accuracy_level=accuracy_level,
             algo_config=algo_config,
+            nodes_to_exclude=nodes_to_exclude or None,
         )
         if "bits" in sig.parameters:
             kwargs["bits"] = bits
@@ -177,6 +179,12 @@ def main():
         default=["decoder_init", "decoder_step"],
         help="Which decoder files to quantize",
     )
+    parser.add_argument(
+        "--nodes-to-exclude",
+        nargs="+",
+        default=None,
+        help="MatMul node names to exclude from quantization (keep at FP32)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -190,7 +198,7 @@ def main():
             print(f"  Skipping {name}.onnx (not found)")
             continue
         dst = os.path.join(args.output, f"{name}{bits_suffix}.onnx")
-        quantize_decoder(src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data)
+        quantize_decoder(src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data, args.nodes_to_exclude)
         quantized_names.add(name)
 
     # Copy non-quantized files from input to output (encoder, tokenizer, config, etc.)
