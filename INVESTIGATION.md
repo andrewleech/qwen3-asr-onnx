@@ -1,4 +1,33 @@
 
+### [111] ORT transformer optimizer — SimplifiedLayerNormalization fusion on decoders
+**Date:** 2026-03-30
+**Idea:** ORT's runtime optimizer does NOT fuse the decomposed RMSNorm pattern (ReduceMean → Pow → Add → Sqrt/Reciprocal → Mul, 113 instances × 5 ops = 565 ops) into `SimplifiedLayerNormalization`. The ORT transformer optimizer (`optimize_model` with `model_type=gpt2`) does fuse these, reducing node count by ~30% (2266 → 1586). Test whether pre-optimizing the decoder graphs improves inference speed. Also test if the GQA attention pattern (16Q/8KV heads, MRoPE) fuses.
+
+**Change:** Ran `onnxruntime.transformers.optimizer.optimize_model` on decoder_init and decoder_step for both FP32 and int4 variants. `opt_level=1`, `num_heads=16`, `hidden_size=1024`.
+
+**Result — FP32 (10-sample quick test, WSL/Linux):**
+| Trial | WER | RTF | Nodes |
+|---|---|---|---|
+| Baseline FP32 | 3.55% | 0.69x | 2266 |
+| RMSNorm-fused FP32 | 3.55% | **0.64x** | 1586 |
+
+**Result — int4 (10-sample quick test, WSL/Linux):**
+| Trial | WER | RTF | Nodes |
+|---|---|---|---|
+| Baseline int4 | 5.92% | 0.29x | ~2266 |
+| RMSNorm-fused int4 | **6.51%** | 0.28x | 1586 |
+
+**Outcome:** MIXED
+- **FP32: SUCCESS** — 7.3% speedup, token-exact output on all 10 samples. The fused `SimplifiedLayerNormalization` op (113 instances) is measurably faster than the 5-op decomposed RMSNorm.
+- **int4: DEGRADED** — 3% speedup but +0.59pp WER regression. The `SimplifiedLayerNormalization` kernel produces slightly different numerical results than the decomposed path when operating on dequantized int4 MatMulNBits outputs. Samples 9-10 diverged.
+- **GQA attention fusion: not achieved** — the Qwen3 attention pattern (MRoPE, GQA) does not match any of ORT's fusion templates. Zero attention-related ops fused.
+
+**Notes:**
+- ORT's runtime graph optimizer (level ALL) does NOT perform this RMSNorm fusion — only the offline transformer optimizer does. This means pre-optimized graphs are genuinely faster.
+- The int4 regression is likely due to accumulated floating point differences: `SimplifiedLayerNormalization` uses a single fused kernel with different intermediate rounding than the 5-op chain. On FP32 this is bit-exact, but on int4 (where inputs have quantization noise) the different rounding propagates.
+- For FP32-only distribution, pre-optimization is safe. For int4, it requires a full 200-sample WER validation before adoption.
+- A future ORT version may add this fusion to the runtime optimizer, making pre-optimization unnecessary.
+
 ### [110] Native FP16 encoder inference regression — Windows benchmark
 **Date:** 2026-03-29
 **Idea:** The native FP16 encoder from [108] halves file size with zero WER impact. Measure whether the 2 Cast nodes at the I/O boundary (FP32→FP16 input, FP16→FP32 output) affect per-inference speed on native Windows.
