@@ -10,7 +10,6 @@ Usage:
 """
 
 import argparse
-import io
 import os
 
 import numpy as np
@@ -45,7 +44,7 @@ def main():
         out_path = os.path.join(args.output, f"sample_{saved:04d}.wav")
         sf.write(out_path, arr, sr)
         duration = len(arr) / sr
-        print(f"  [{saved+1}/{args.n_samples}] {os.path.basename(out_path)} ({duration:.1f}s)")
+        print(f"  [{saved + 1}/{args.n_samples}] {os.path.basename(out_path)} ({duration:.1f}s)")
         saved += 1
 
     print(f"Done. {saved} files saved to {args.output}/")

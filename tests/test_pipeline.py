@@ -20,7 +20,7 @@ from transformers import AutoModel, AutoTokenizer
 from src.encoder_wrapper import EncoderWrapper
 from src.inference import greedy_decode_onnx
 from src.mel import log_mel_spectrogram
-from src.prompt import build_prompt_ids, get_audio_pad_range, EOS_TOKEN_IDS
+from src.prompt import EOS_TOKEN_IDS, build_prompt_ids, get_audio_pad_range
 
 OUTPUT_DIR = "output/qwen3-asr-0.6b"
 AUDIO_PATH = "tests/fixtures/test_audio.wav"
@@ -42,6 +42,7 @@ def audio():
     data, sr = sf.read(AUDIO_PATH, dtype="float32")
     if sr != 16000:
         import librosa
+
         data = librosa.resample(data, orig_sr=sr, target_sr=16000)
     if data.ndim > 1:
         data = data.mean(axis=1)
@@ -68,8 +69,11 @@ def pytorch_model():
         from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
             Qwen3ASRForConditionalGeneration,
         )
+
         model = Qwen3ASRForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen3-ASR-0.6B", torch_dtype=torch.float32, device_map="cpu",
+            "Qwen/Qwen3-ASR-0.6B",
+            torch_dtype=torch.float32,
+            device_map="cpu",
         )
     model.eval()
     return model
@@ -77,9 +81,7 @@ def pytorch_model():
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    return AutoTokenizer.from_pretrained(
-        "Qwen/Qwen3-ASR-0.6B", trust_remote_code=True
-    )
+    return AutoTokenizer.from_pretrained("Qwen/Qwen3-ASR-0.6B", trust_remote_code=True)
 
 
 @pytest.fixture(scope="module")
@@ -166,16 +168,12 @@ def decode_pytorch(model, audio_features, prompt_ids, max_tokens=256):
 class TestPipeline:
     def test_encoder_produces_features(self, onnx_sessions, mel):
         """Encoder should produce non-zero features."""
-        features = onnx_sessions["encoder"].run(
-            ["audio_features"], {"mel": mel.numpy()}
-        )[0]
+        features = onnx_sessions["encoder"].run(["audio_features"], {"mel": mel.numpy()})[0]
         assert features.shape[0] == 1
         assert features.shape[2] == 1024
         assert not np.allclose(features, 0), "Encoder produced all zeros"
 
-    def test_transcription_matches(
-        self, pytorch_model, onnx_sessions, embed_tokens, mel, tokenizer
-    ):
+    def test_transcription_matches(self, pytorch_model, onnx_sessions, embed_tokens, mel, tokenizer):
         """ONNX transcription should match PyTorch transcription."""
         mel_np = mel.numpy()
 
@@ -183,9 +181,7 @@ class TestPipeline:
         wrapper = EncoderWrapper(pytorch_model.thinker.audio_tower).eval()
         with torch.no_grad():
             pt_features = wrapper(mel)
-        onnx_features = onnx_sessions["encoder"].run(
-            ["audio_features"], {"mel": mel_np}
-        )[0]
+        onnx_features = onnx_sessions["encoder"].run(["audio_features"], {"mel": mel_np})[0]
 
         audio_token_count = pt_features.shape[1]
         prompt_ids = build_prompt_ids(audio_token_count)
@@ -206,16 +202,13 @@ class TestPipeline:
         match_rate = match / total if total > 0 else 1.0
 
         assert match_rate >= 0.95, (
-            f"Token match rate {match_rate:.1%} below 95% threshold. "
-            f"PT: {pt_text!r}, ONNX: {onnx_text!r}"
+            f"Token match rate {match_rate:.1%} below 95% threshold. PT: {pt_text!r}, ONNX: {onnx_text!r}"
         )
 
     def test_greedy_deterministic(self, onnx_sessions, embed_tokens, mel):
         """Running ONNX decode twice should produce identical output."""
         mel_np = mel.numpy()
-        features = onnx_sessions["encoder"].run(
-            ["audio_features"], {"mel": mel_np}
-        )[0]
+        features = onnx_sessions["encoder"].run(["audio_features"], {"mel": mel_np})[0]
 
         audio_token_count = features.shape[1]
         prompt_ids = build_prompt_ids(audio_token_count)

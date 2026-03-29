@@ -20,9 +20,7 @@ import shutil
 import tempfile
 
 import onnx
-from onnxruntime.quantization import quantize_dynamic, QuantType
-
-
+from onnxruntime.quantization import QuantType, quantize_dynamic
 
 ONNX_FILES = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"]
 
@@ -43,13 +41,14 @@ def _simplify_if_needed(input_path: str) -> str:
     """
     try:
         import onnxsim
+
         model = onnx.load(input_path, load_external_data=True)
         model_sim, ok = onnxsim.simplify(model)
         if ok:
-            tmpfile = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)
+            tmpfile = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)  # noqa: SIM115
             tmpfile.close()  # Close before writing so onnx.save can open it on all platforms
             onnx.save(model_sim, tmpfile.name)
-            print(f"    Simplified for shape inference compatibility")
+            print("    Simplified for shape inference compatibility")
             return tmpfile.name
     except Exception:
         pass
@@ -100,11 +99,7 @@ def quantize_onnx_file(
     in_size = _total_size(input_path)
     out_size = _total_size(output_path)
     ratio = out_size / in_size
-    print(
-        f"    {in_size / 1e6:.1f} MB -> {out_size / 1e6:.1f} MB "
-        f"({ratio:.1%})"
-    )
-
+    print(f"    {in_size / 1e6:.1f} MB -> {out_size / 1e6:.1f} MB ({ratio:.1%})")
 
 
 def main():
@@ -161,7 +156,8 @@ def main():
         # Only apply node exclusions to decoder files (encoder uses op_type filtering)
         file_exclude = exclude_nodes if filename != "encoder.onnx" else None
         quantize_onnx_file(
-            input_path, output_path,
+            input_path,
+            output_path,
             op_types_to_quantize=encoder_only_matmul,
             weight_type=weight_type,
             nodes_to_exclude=file_exclude,
@@ -182,7 +178,7 @@ def main():
     if os.path.exists(step_data):
         step_size = os.path.getsize(step_data)
         if step_size < 1.8e9:  # safe margin under 2 GB protobuf limit
-            print(f"\nInlining INT8 decoder_step weights into .onnx proto...")
+            print("\nInlining INT8 decoder_step weights into .onnx proto...")
             step_model = onnx.load(step_out, load_external_data=True)
             onnx.save(step_model, step_out)
             os.remove(step_data)

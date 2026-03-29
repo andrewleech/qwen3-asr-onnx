@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(
 def pytorch_model():
     try:
         from transformers import AutoModel
+
         model = AutoModel.from_pretrained(
             "Qwen/Qwen3-ASR-0.6B",
             torch_dtype=torch.float32,
@@ -36,8 +37,11 @@ def pytorch_model():
         from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
             Qwen3ASRForConditionalGeneration,
         )
+
         model = Qwen3ASRForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen3-ASR-0.6B", torch_dtype=torch.float32, device_map="cpu",
+            "Qwen/Qwen3-ASR-0.6B",
+            torch_dtype=torch.float32,
+            device_map="cpu",
         )
     model.eval()
     return model
@@ -57,11 +61,13 @@ def test_mel():
     audio_path = "tests/fixtures/test_audio.wav"
     if os.path.exists(audio_path):
         import soundfile as sf
+
         from src.mel import log_mel_spectrogram
 
         audio, sr = sf.read(audio_path, dtype="float32")
         if sr != 16000:
             import librosa
+
             audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
@@ -102,9 +108,7 @@ class TestEncoderExport:
         # ONNX
         onnx_output = onnx_session.run(["audio_features"], {"mel": mel_np})[0]
 
-        assert pt_output.shape == onnx_output.shape, (
-            f"Shape mismatch: PT={pt_output.shape} ONNX={onnx_output.shape}"
-        )
+        assert pt_output.shape == onnx_output.shape, f"Shape mismatch: PT={pt_output.shape} ONNX={onnx_output.shape}"
 
         max_diff = np.max(np.abs(pt_output - onnx_output))
         assert max_diff < 1e-4, f"Max diff {max_diff:.6e} exceeds threshold 1e-4"
@@ -127,9 +131,7 @@ class TestEncoderExport:
             result = onnx_session.run(["audio_features"], {"mel": mel})
             features = result[0]
             expected = _get_feat_extract_output_lengths(n_frames)
-            assert features.shape[1] == expected, (
-                f"T={n_frames}: got {features.shape[1]} tokens, expected {expected}"
-            )
+            assert features.shape[1] == expected, f"T={n_frames}: got {features.shape[1]} tokens, expected {expected}"
 
     def test_single_batch(self, onnx_session):
         """Encoder processes batch=1 (original model doesn't support batch>1)."""

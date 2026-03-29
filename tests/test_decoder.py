@@ -19,7 +19,7 @@ import onnxruntime as ort
 import pytest
 import torch
 
-from src.decoder_wrapper import NUM_LAYERS, NUM_KV_HEADS, HEAD_DIM
+from src.decoder_wrapper import HEAD_DIM, NUM_KV_HEADS, NUM_LAYERS
 
 pytestmark = pytest.mark.skipif(
     not os.path.exists("output/qwen3-asr-0.6b/decoder_init.onnx"),
@@ -31,6 +31,7 @@ pytestmark = pytest.mark.skipif(
 def pytorch_model():
     try:
         from transformers import AutoModel
+
         model = AutoModel.from_pretrained(
             "Qwen/Qwen3-ASR-0.6B",
             torch_dtype=torch.float32,
@@ -42,8 +43,11 @@ def pytorch_model():
         from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
             Qwen3ASRForConditionalGeneration,
         )
+
         model = Qwen3ASRForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen3-ASR-0.6B", torch_dtype=torch.float32, device_map="cpu",
+            "Qwen/Qwen3-ASR-0.6B",
+            torch_dtype=torch.float32,
+            device_map="cpu",
         )
     model.eval()
     return model
@@ -172,7 +176,7 @@ class TestDecoderStep:
 
         # Run 5 steps
         current_pos = seq_len
-        for step in range(5):
+        for _step in range(5):
             step_embeds = np.random.randn(1, 1, 1024).astype(np.float32)
             step_pos = np.array([[current_pos]], dtype=np.int64)
 

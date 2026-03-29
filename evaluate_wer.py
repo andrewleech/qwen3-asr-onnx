@@ -27,20 +27,19 @@ import json
 import os
 import re
 import string
-import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Iterator
 
 import numpy as np
 import onnxruntime as ort
 import soundfile as sf
-from datasets import load_dataset, Audio
-
+from datasets import Audio, load_dataset
 
 # ---------------------------------------------------------------------------
 # Text normalization
 # ---------------------------------------------------------------------------
+
 
 def normalize(text: str) -> str:
     """
@@ -107,6 +106,7 @@ def wer(references: list[str], hypotheses: list[str]) -> float:
 # ONNX inference
 # ---------------------------------------------------------------------------
 
+
 def _resolve_model_path(model_dir: str, name: str, quant: str | None = None) -> str:
     """Resolve model file with quantization suffix, falling back to FP32.
 
@@ -165,9 +165,8 @@ _tokenizer_cache: dict = {}
 def get_tokenizer(model_dir: str):
     if model_dir not in _tokenizer_cache:
         from transformers import AutoTokenizer
-        _tokenizer_cache[model_dir] = AutoTokenizer.from_pretrained(
-            model_dir, trust_remote_code=True
-        )
+
+        _tokenizer_cache[model_dir] = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
     return _tokenizer_cache[model_dir]
 
 
@@ -221,6 +220,7 @@ def stream_samples(dataset_key: str, n: int) -> Iterator[tuple[np.ndarray, str]]
         # Resample to 16kHz if needed
         if sr != 16000:
             import librosa
+
             arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
 
         ref = sample[text_field]
@@ -235,6 +235,7 @@ def stream_samples(dataset_key: str, n: int) -> Iterator[tuple[np.ndarray, str]]
 # Evaluation loop
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ModelResult:
     name: str
@@ -243,7 +244,9 @@ class ModelResult:
     pairs: dict = field(default_factory=dict)
 
 
-def evaluate(model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[str], n_samples: int, output_path: str | None):
+def evaluate(
+    model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[str], n_samples: int, output_path: str | None
+):
     """
     Main evaluation loop.
 
@@ -268,9 +271,9 @@ def evaluate(model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[s
     for dataset_key in dataset_keys:
         cfg = DATASET_CONFIGS[dataset_key]
         label = cfg["label"]
-        print(f"{'='*72}")
+        print(f"{'=' * 72}")
         print(f"Dataset: {label}  (n={n_samples})")
-        print(f"{'='*72}")
+        print(f"{'=' * 72}")
 
         for name, *_ in models:
             results[name][dataset_key] = []  # list of (ref, hyp) normalized pairs
@@ -289,7 +292,7 @@ def evaluate(model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[s
             elapsed = time.time() - t_start
             print(f"  [{sample_count:4d}/{n_samples}] {elapsed:6.0f}s  ref: {ref_norm[:60]}")
 
-            for name, model_dir, sessions, embed, tokenizer in models:
+            for name, _model_dir, sessions, embed, tokenizer in models:
                 try:
                     t0 = time.time()
                     hyp_raw = _run(sessions, embed, tokenizer, audio)
@@ -308,9 +311,9 @@ def evaluate(model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[s
         print()
 
     # Summary table
-    print(f"\n{'='*72}")
+    print(f"\n{'=' * 72}")
     print(f"{'SUMMARY':^72}")
-    print(f"{'='*72}")
+    print(f"{'=' * 72}")
     col_w = max(len(n) for n, *_ in models) + 2
     header = f"{'Dataset':<28} {'Model':<{col_w}} {'Samples':>8} {'WER%':>7} {'Time':>8} {'RTF':>7}"
     print(header)
@@ -330,9 +333,17 @@ def evaluate(model_dirs: list[tuple[str, str, str | None]], dataset_keys: list[s
             t = infer_times[name]
             rtf = t / total_audio_secs if total_audio_secs > 0 else 0
             print(f"{label:<28} {name:<{col_w}} {n:>8} {w:>7.2f} {t:>7.1f}s {rtf:>6.2f}x")
-            summary.append({"dataset": label, "model": name, "n": n, "wer": round(w, 4),
-                            "infer_secs": round(t, 1), "audio_secs": round(total_audio_secs, 1),
-                            "rtf": round(rtf, 3)})
+            summary.append(
+                {
+                    "dataset": label,
+                    "model": name,
+                    "n": n,
+                    "wer": round(w, 4),
+                    "infer_secs": round(t, 1),
+                    "audio_secs": round(total_audio_secs, 1),
+                    "rtf": round(rtf, 3),
+                }
+            )
 
     if output_path:
         with open(output_path, "w") as f:
@@ -344,7 +355,7 @@ def _run(sessions: dict, embed_tokens: np.ndarray, tokenizer, audio: np.ndarray)
     """Run full ONNX pipeline, return raw decoded text."""
     from src.inference import greedy_decode_onnx
     from src.mel import log_mel_spectrogram
-    from src.prompt import build_prompt_ids, EOS_TOKEN_IDS
+    from src.prompt import EOS_TOKEN_IDS, build_prompt_ids
 
     mel = log_mel_spectrogram(audio)
     mel_np = mel.cpu().numpy()
@@ -361,17 +372,16 @@ def _run(sessions: dict, embed_tokens: np.ndarray, tokenizer, audio: np.ndarray)
     while tokens and tokens[-1] in EOS_TOKEN_IDS:
         tokens.pop()
 
-    return tokenizer.decode(tokens, skip_special_tokens=True)
+    return tokenizer.decode(tokens, skip_special_tokens=True)  # type: ignore[no-any-return]
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate WER of Qwen3-ASR ONNX models on benchmark datasets"
-    )
+    parser = argparse.ArgumentParser(description="Evaluate WER of Qwen3-ASR ONNX models on benchmark datasets")
     parser.add_argument(
         "--models",
         nargs="+",

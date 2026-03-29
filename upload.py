@@ -19,7 +19,6 @@ import os
 
 from huggingface_hub import HfApi
 
-
 MODEL_CARD_HEADER = """\
 ---
 license: apache-2.0
@@ -62,9 +61,8 @@ INT4_SECTION = """\
 |---|---|
 | `encoder.int4.onnx` | Encoder (native FP16 via autocast export, FP32 I/O, half the size of FP32) |
 | `decoder_init.int4.onnx` | int4 decoder prefill |
-| `decoder_init.int4.onnx.data` | Weights for int4 decoder_init |
 | `decoder_step.int4.onnx` | int4 decoder step |
-| `decoder_step.int4.onnx.data` | Weights for int4 decoder_step |
+| `decoder_weights.int4.data` | Shared external weights for both int4 decoders (loaded once) |
 """
 
 MODEL_CARD_FOOTER = """\
@@ -73,7 +71,7 @@ MODEL_CARD_FOOTER = """\
 
 | File | Description |
 |---|---|
-| `embed_tokens.bin` | Token embedding matrix [{vocab_size}, {hidden_size}], float32 |
+| `embed_tokens.bin` | Token embedding matrix [{vocab_size}, {hidden_size}], float16 |
 | `tokenizer.json` | HuggingFace tokenizer |
 | `config.json` | Architecture config, special tokens, mel params |
 | `preprocessor_config.json` | Mel spectrogram parameters (WhisperFeatureExtractor format) |
@@ -191,9 +189,7 @@ def main():
     model_name = base_model.rsplit("/", 1)[-1]
 
     # Build and write model card
-    readme_content, variants_str = build_model_card(
-        args.input, base_model, model_name, vocab_size, hidden_size, config
-    )
+    readme_content, variants_str = build_model_card(args.input, base_model, model_name, vocab_size, hidden_size, config)
     readme_path = os.path.join(args.input, "README.md")
     with open(readme_path, "w") as f:
         f.write(readme_content)
@@ -213,7 +209,7 @@ def main():
     # Confirm before destructive upload
     if not args.force:
         print(f"\nTarget repo: https://huggingface.co/{args.repo}")
-        print(f"This will replace ALL existing contents of that repo.")
+        print("This will replace ALL existing contents of that repo.")
         answer = input("Proceed? [y/N] ").strip().lower()
         if answer != "y":
             print("Aborted.")

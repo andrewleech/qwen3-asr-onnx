@@ -7,8 +7,6 @@ Parameters are identical to OpenAI Whisper.
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-
 
 SAMPLE_RATE = 16000
 N_FFT = 400
@@ -59,7 +57,7 @@ def log_mel_spectrogram(
 
     # Compute mel filterbank
     mel_filters = _mel_filterbank(sample_rate, n_fft, n_mels, fmin, fmax)
-    mel_filters = torch.from_numpy(mel_filters).float().to(device)
+    mel_filters_t = torch.from_numpy(mel_filters).float().to(device)
 
     # STFT
     window = torch.hann_window(n_fft).to(device)
@@ -75,7 +73,7 @@ def log_mel_spectrogram(
     magnitudes = stft.abs() ** 2
 
     # Apply mel filterbank
-    mel_spec = mel_filters @ magnitudes  # [n_mels, time]
+    mel_spec = mel_filters_t @ magnitudes  # [n_mels, time]
 
     # Log scale (clamp for numerical stability)
     log_spec = torch.clamp(mel_spec, min=1e-10).log10()

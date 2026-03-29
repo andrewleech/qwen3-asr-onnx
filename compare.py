@@ -17,7 +17,6 @@ import argparse
 import json
 import os
 import time
-from textwrap import indent
 
 import numpy as np
 import onnxruntime as ort
@@ -29,6 +28,7 @@ from transformers import AutoTokenizer
 # Path 1: Native qwen-asr inference
 # ---------------------------------------------------------------------------
 
+
 def run_native(model, processor, audio: np.ndarray, sr: int = 16000) -> dict:
     """Run native qwen-asr inference (processor + model.generate)."""
     from src.prompt import EOS_TOKEN_IDS
@@ -38,9 +38,7 @@ def run_native(model, processor, audio: np.ndarray, sr: int = 16000) -> dict:
         {"role": "system", "content": ""},
         {"role": "user", "content": [{"type": "audio", "audio": ""}]},
     ]
-    text_prompt = processor.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False
-    )
+    text_prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
     inputs = processor(
         text=[text_prompt],
@@ -84,11 +82,12 @@ def run_native(model, processor, audio: np.ndarray, sr: int = 16000) -> dict:
 # Path 2: PyTorch wrapper (same architecture as ONNX export)
 # ---------------------------------------------------------------------------
 
+
 def run_wrapper_pytorch(model, audio: np.ndarray, tokenizer, device: str = "cpu") -> dict:
     """Run our PyTorch wrappers (EncoderWrapper + greedy_decode_pytorch)."""
     from src.encoder_wrapper import EncoderWrapper
     from src.mel import log_mel_spectrogram
-    from src.prompt import build_prompt_ids, EOS_TOKEN_IDS
+    from src.prompt import EOS_TOKEN_IDS, build_prompt_ids
 
     # Mel spectrogram
     mel_torch = log_mel_spectrogram(audio, device=device)
@@ -103,6 +102,7 @@ def run_wrapper_pytorch(model, audio: np.ndarray, tokenizer, device: str = "cpu"
     prompt_ids = build_prompt_ids(audio_token_count)
 
     from validate import greedy_decode_pytorch
+
     t0 = time.time()
     tokens = greedy_decode_pytorch(model, audio_features, prompt_ids, max_tokens=256, device=device)
     elapsed = time.time() - t0
@@ -126,6 +126,7 @@ def run_wrapper_pytorch(model, audio: np.ndarray, tokenizer, device: str = "cpu"
 # Paths 3 & 4: ONNX Runtime (FP32 or INT8)
 # ---------------------------------------------------------------------------
 
+
 def load_onnx_sessions(onnx_dir: str) -> dict:
     """Load ONNX runtime sessions for split decoder architecture."""
     sessions = {}
@@ -144,7 +145,7 @@ def run_onnx(sessions, embed_tokens, audio: np.ndarray, tokenizer, label: str) -
     """Run full ONNX pipeline with split decoder (decoder_init + decoder_step)."""
     from src.inference import greedy_decode_onnx
     from src.mel import log_mel_spectrogram
-    from src.prompt import build_prompt_ids, EOS_TOKEN_IDS
+    from src.prompt import EOS_TOKEN_IDS, build_prompt_ids
 
     # Mel
     mel_torch = log_mel_spectrogram(audio)
@@ -182,9 +183,11 @@ def run_onnx(sessions, embed_tokens, audio: np.ndarray, tokenizer, label: str) -
 # Comparison helpers
 # ---------------------------------------------------------------------------
 
+
 def strip_asr_prefix(text: str) -> str:
     """Strip 'language English<asr_text>' prefix from model output."""
     import re
+
     # Remove "language X<asr_text>" or just "<asr_text>" prefix
     text = re.sub(r"^language\s+\w+<asr_text>", "", text)
     text = re.sub(r"^<asr_text>", "", text)
@@ -221,7 +224,6 @@ def compare_tokens(results: dict[str, dict]):
 
 def compare_encoder_features(results: dict[str, dict]):
     """Compare encoder feature tensors where available."""
-    pairs = []
     names_with_features = [n for n, r in results.items() if "audio_features" in r]
     if len(names_with_features) < 2:
         return
@@ -244,11 +246,13 @@ def compare_encoder_features(results: dict[str, dict]):
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="Compare ASR inference across 4 paths")
     parser.add_argument("--audio", nargs="+", required=True, help="Audio WAV files")
-    parser.add_argument("--ground-truth", nargs="*", default=None,
-                        help="Ground truth transcriptions (one per audio file)")
+    parser.add_argument(
+        "--ground-truth", nargs="*", default=None, help="Ground truth transcriptions (one per audio file)"
+    )
     parser.add_argument("--model", default="Qwen/Qwen3-ASR-0.6B")
     parser.add_argument("--fp32-dir", default="output/qwen3-asr-0.6b")
     parser.add_argument("--int8-dir", default="output/qwen3-asr-0.6b-int8")
@@ -265,21 +269,28 @@ def main():
     print("Loading PyTorch model...")
     try:
         from transformers import AutoModel
+
         model = AutoModel.from_pretrained(
-            args.model, torch_dtype=torch.float32,
-            device_map=args.device, trust_remote_code=True,
+            args.model,
+            torch_dtype=torch.float32,
+            device_map=args.device,
+            trust_remote_code=True,
         )
     except Exception:
         from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
             Qwen3ASRForConditionalGeneration,
         )
+
         model = Qwen3ASRForConditionalGeneration.from_pretrained(
-            args.model, torch_dtype=torch.float32, device_map=args.device,
+            args.model,
+            torch_dtype=torch.float32,
+            device_map=args.device,
         )
     model.eval()
 
     print("Loading processor...")
     from qwen_asr.core.transformers_backend.processing_qwen3_asr import Qwen3ASRProcessor
+
     processor = Qwen3ASRProcessor.from_pretrained(args.model)
 
     print("Loading tokenizer...")
@@ -296,9 +307,7 @@ def main():
         with open(os.path.join(onnx_dir, "config.json")) as f:
             cfg = json.load(f)
         dtype = np.dtype(cfg.get("embed_tokens_dtype", "float32"))
-        embed = np.fromfile(
-            os.path.join(onnx_dir, "embed_tokens.bin"), dtype=dtype
-        ).reshape(cfg["embed_tokens_shape"])
+        embed = np.fromfile(os.path.join(onnx_dir, "embed_tokens.bin"), dtype=dtype).reshape(cfg["embed_tokens_shape"])
         # Always work in float32
         return embed.astype(np.float32)
 
@@ -309,16 +318,17 @@ def main():
     # Run comparisons
     # -----------------------------------------------------------------------
     for audio_path, gt in zip(args.audio, ground_truths):
-        print(f"\n{'='*72}")
+        print(f"\n{'=' * 72}")
         print(f"Audio: {audio_path}")
         audio, sr = sf.read(audio_path, dtype="float32")
         if sr != 16000:
             import librosa
+
             audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
-        print(f"Duration: {len(audio)/16000:.1f}s  ({len(audio)} samples)")
-        print(f"{'='*72}")
+        print(f"Duration: {len(audio) / 16000:.1f}s  ({len(audio)} samples)")
+        print(f"{'=' * 72}")
 
         results = {}
 
@@ -339,14 +349,14 @@ def main():
         results["int8"] = run_onnx(int8_sessions, int8_embed, audio, tokenizer, "INT8")
 
         # --- Report ---
-        print(f"\n--- Transcriptions ---")
+        print("\n--- Transcriptions ---")
         compare_texts(results, gt)
 
-        print(f"\n--- Timing ---")
+        print("\n--- Timing ---")
         for name, r in results.items():
             print(f"  {name:12s}: {r['time']:.2f}s")
 
-        print(f"\n--- Token Comparison ---")
+        print("\n--- Token Comparison ---")
         compare_tokens(results)
 
         # Also compare non-native paths pairwise
@@ -363,11 +373,11 @@ def main():
                     status = "EXACT" if exact else f"{match}/{total} match"
                     print(f"  {a} vs {b}: {status}")
 
-        print(f"\n--- Encoder Features ---")
+        print("\n--- Encoder Features ---")
         compare_encoder_features(results)
 
         # Shapes info
-        print(f"\n--- Audio Token Counts ---")
+        print("\n--- Audio Token Counts ---")
         for name, r in results.items():
             if "mel_frames" in r:
                 print(f"  {name:12s}: mel_frames={r['mel_frames']}, audio_tokens={r['audio_token_count']}")

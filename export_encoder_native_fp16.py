@@ -30,8 +30,8 @@ import os
 
 import numpy as np
 import onnx
-from onnx import TensorProto, helper
 import torch
+from onnx import TensorProto, helper
 
 from src.encoder_wrapper import EncoderWrapper, _get_feat_extract_output_lengths
 
@@ -63,8 +63,11 @@ def _patch_io_to_fp32(model_path, output_dim):
         if inp.name == "mel_fp16":
             model.graph.input.remove(inp)
     cast_in = helper.make_node(
-        "Cast", ["mel"], ["mel_fp16"],
-        to=TensorProto.FLOAT16, name="cast_mel_fp32_to_fp16",
+        "Cast",
+        ["mel"],
+        ["mel_fp16"],
+        to=TensorProto.FLOAT16,
+        name="cast_mel_fp32_to_fp16",
     )
     model.graph.node.insert(0, cast_in)
 
@@ -79,15 +82,20 @@ def _patch_io_to_fp32(model_path, output_dim):
 
     # Add FP32 output + Cast node
     af_fp32 = helper.make_tensor_value_info(
-        "audio_features", TensorProto.FLOAT, [1, "enc_time", output_dim],
+        "audio_features",
+        TensorProto.FLOAT,
+        [1, "enc_time", output_dim],
     )
     model.graph.output.insert(0, af_fp32)
     for out in list(model.graph.output):
         if out.name == "audio_features_fp16":
             model.graph.output.remove(out)
     cast_out = helper.make_node(
-        "Cast", ["audio_features_fp16"], ["audio_features"],
-        to=TensorProto.FLOAT, name="cast_features_fp16_to_fp32",
+        "Cast",
+        ["audio_features_fp16"],
+        ["audio_features"],
+        to=TensorProto.FLOAT,
+        name="cast_features_fp16_to_fp32",
     )
     model.graph.node.append(cast_out)
 
@@ -95,19 +103,18 @@ def _patch_io_to_fp32(model_path, output_dim):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Export encoder in native FP16 (autocast, FP32 I/O)"
-    )
+    parser = argparse.ArgumentParser(description="Export encoder in native FP16 (autocast, FP32 I/O)")
     parser.add_argument("--model", default="Qwen/Qwen3-ASR-0.6B")
-    parser.add_argument("--output", required=True,
-                        help="Output path (e.g. output/qwen3-asr-0.6b/encoder.int4.onnx)")
+    parser.add_argument("--output", required=True, help="Output path (e.g. output/qwen3-asr-0.6b/encoder.int4.onnx)")
     parser.add_argument("--opset", type=int, default=17)
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify ORT loads the result and produces correct output shape")
+    parser.add_argument(
+        "--verify", action="store_true", help="Verify ORT loads the result and produces correct output shape"
+    )
     args = parser.parse_args()
 
     print(f"Loading {args.model} in float32 (will autocast to FP16 during export)...")
     from export import load_model
+
     model = load_model(args.model, dtype=torch.float32)
 
     audio_tower = model.thinker.audio_tower
@@ -142,6 +149,7 @@ def main():
 
     # Fix Reshape allowzero for DirectML compatibility
     from src.onnx_fixup import fix_reshape_allowzero
+
     n = fix_reshape_allowzero(args.output)
     print(f"  Fixed {n} Reshape allowzero attrs")
 
@@ -172,6 +180,7 @@ def main():
     if args.verify:
         print("\nVerifying ORT load...")
         import onnxruntime as ort
+
         opts = ort.SessionOptions()
         opts.log_severity_level = 3
         sess = ort.InferenceSession(args.output, opts)

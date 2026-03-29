@@ -41,10 +41,10 @@ from onnxruntime.quantization import (
 
 from share_weights import share_external_models
 
-
 # ---------------------------------------------------------------------------
 # Calibration data collection
 # ---------------------------------------------------------------------------
+
 
 def collect_calibration_data(
     model_dir: str,
@@ -62,21 +62,15 @@ def collect_calibration_data(
     Returns (init_inputs, step_inputs) as lists of numpy dict.
     """
     from src.mel import log_mel_spectrogram
-    from src.prompt import build_prompt_ids, get_audio_pad_range, EOS_TOKEN_IDS
+    from src.prompt import EOS_TOKEN_IDS, build_prompt_ids, get_audio_pad_range
 
     providers = ["CPUExecutionProvider"]
     opts = ort.SessionOptions()
     opts.log_severity_level = 3
 
-    encoder = ort.InferenceSession(
-        os.path.join(model_dir, "encoder.onnx"), opts, providers=providers
-    )
-    decoder_init = ort.InferenceSession(
-        os.path.join(model_dir, "decoder_init.onnx"), opts, providers=providers
-    )
-    decoder_step = ort.InferenceSession(
-        os.path.join(model_dir, "decoder_step.onnx"), opts, providers=providers
-    )
+    encoder = ort.InferenceSession(os.path.join(model_dir, "encoder.onnx"), opts, providers=providers)
+    decoder_init = ort.InferenceSession(os.path.join(model_dir, "decoder_init.onnx"), opts, providers=providers)
+    decoder_step = ort.InferenceSession(os.path.join(model_dir, "decoder_step.onnx"), opts, providers=providers)
 
     # Load embeddings
     config_path = os.path.join(model_dir, "config.json")
@@ -85,9 +79,9 @@ def collect_calibration_data(
     dtype_str = cfg.get("embed_tokens_dtype", "float32")
     shape = cfg["embed_tokens_shape"]
     dtype = np.float16 if dtype_str == "float16" else np.float32
-    embed_tokens = np.fromfile(
-        os.path.join(model_dir, "embed_tokens.bin"), dtype=dtype
-    ).reshape(shape).astype(np.float32)
+    embed_tokens = (
+        np.fromfile(os.path.join(model_dir, "embed_tokens.bin"), dtype=dtype).reshape(shape).astype(np.float32)
+    )
 
     # Stream calibration audio
     ds = load_dataset(
@@ -139,10 +133,12 @@ def collect_calibration_data(
             position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
 
             # Collect decoder_init input
-            init_inputs.append({
-                "input_embeds": input_embeds.copy(),
-                "position_ids": position_ids.copy(),
-            })
+            init_inputs.append(
+                {
+                    "input_embeds": input_embeds.copy(),
+                    "position_ids": position_ids.copy(),
+                }
+            )
 
             # Run decoder_init
             logits, keys, values = decoder_init.run(
@@ -154,19 +150,21 @@ def collect_calibration_data(
             pos = len(prompt_ids)
 
             # Collect decoder_step inputs for n_steps
-            for step in range(n_steps):
+            for _step in range(n_steps):
                 if next_token in EOS_TOKEN_IDS:
                     break
 
                 step_embed = embed_tokens[next_token][np.newaxis, np.newaxis, :]
                 step_pos = np.array([[pos]], dtype=np.int64)
 
-                step_inputs.append({
-                    "input_embeds": step_embed.copy(),
-                    "position_ids": step_pos.copy(),
-                    "past_keys": keys.copy(),
-                    "past_values": values.copy(),
-                })
+                step_inputs.append(
+                    {
+                        "input_embeds": step_embed.copy(),
+                        "position_ids": step_pos.copy(),
+                        "past_keys": keys.copy(),
+                        "past_values": values.copy(),
+                    }
+                )
 
                 logits, keys, values = decoder_step.run(
                     ["logits", "present_keys", "present_values"],
@@ -182,8 +180,7 @@ def collect_calibration_data(
 
             sample_count += 1
             if sample_count % 8 == 0:
-                print(f"  {sample_count}/{n_samples} samples "
-                      f"({len(init_inputs)} init, {len(step_inputs)} step inputs)")
+                print(f"  {sample_count}/{n_samples} samples ({len(init_inputs)} init, {len(step_inputs)} step inputs)")
 
         except Exception as e:
             print(f"  Warning: sample skipped ({e})")
@@ -215,6 +212,7 @@ class DecoderCalibrationReader(CalibrationDataReader):
 # Quantization
 # ---------------------------------------------------------------------------
 
+
 def quantize_decoder(
     input_path: str,
     output_path: str,
@@ -225,8 +223,7 @@ def quantize_decoder(
     quant_format: QuantFormat = QuantFormat.QOperator,
 ):
     """Apply static INT8 quantization to a decoder ONNX model."""
-    print(f"  Static quantization of {os.path.basename(input_path)} "
-          f"({len(calibration_inputs)} calibration samples)...")
+    print(f"  Static quantization of {os.path.basename(input_path)} ({len(calibration_inputs)} calibration samples)...")
 
     reader = DecoderCalibrationReader(calibration_inputs)
 
@@ -269,50 +266,65 @@ def quantize_decoder(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Static INT8 quantization for Qwen3-ASR decoder"
-    )
+    parser = argparse.ArgumentParser(description="Static INT8 quantization for Qwen3-ASR decoder")
     parser.add_argument(
-        "--input", required=True,
+        "--input",
+        required=True,
         help="Input directory with FP32 ONNX files (smooth or unsmooth)",
     )
     parser.add_argument(
-        "--output", required=True,
+        "--output",
+        required=True,
         help="Output directory for statically quantized files",
     )
     parser.add_argument(
-        "--n-samples", type=int, default=32,
+        "--n-samples",
+        type=int,
+        default=32,
         help="Number of audio samples for calibration (default: 32)",
     )
     parser.add_argument(
-        "--n-steps", type=int, default=16,
+        "--n-steps",
+        type=int,
+        default=16,
         help="Decoder steps per sample for calibration (default: 16)",
     )
     parser.add_argument(
-        "--calibrate-method", type=str, default="minmax",
+        "--calibrate-method",
+        type=str,
+        default="minmax",
         choices=["minmax", "entropy", "percentile"],
         help="Calibration method (default: minmax)",
     )
     parser.add_argument(
-        "--per-channel", action="store_true",
+        "--per-channel",
+        action="store_true",
         help="Use per-channel weight quantization",
     )
     parser.add_argument(
-        "--nodes-to-exclude", type=str, default=None,
+        "--nodes-to-exclude",
+        type=str,
+        default=None,
         help="Comma-separated node names to exclude from quantization",
     )
     parser.add_argument(
-        "--quant-format", type=str, default="qoperator",
+        "--quant-format",
+        type=str,
+        default="qoperator",
         choices=["qoperator", "qdq"],
         help="Quantization format: qoperator (fused ops) or qdq (Q/DQ nodes). Default: qoperator",
     )
     parser.add_argument(
-        "--no-share-weights", action="store_true",
+        "--no-share-weights",
+        action="store_true",
         help="Skip weight sharing for split decoder",
     )
     parser.add_argument(
-        "--cache-dir", type=str, default=None,
+        "--cache-dir",
+        type=str,
+        default=None,
         help="Directory to cache/load calibration data (.npz)",
     )
     args = parser.parse_args()
@@ -340,10 +352,7 @@ def main():
     cache_path = None
     if args.cache_dir:
         os.makedirs(args.cache_dir, exist_ok=True)
-        cache_path = os.path.join(
-            args.cache_dir,
-            f"calib_n{args.n_samples}_s{args.n_steps}.npz"
-        )
+        cache_path = os.path.join(args.cache_dir, f"calib_n{args.n_samples}_s{args.n_steps}.npz")
 
     if cache_path and os.path.exists(cache_path):
         print(f"Loading cached calibration data from {cache_path}...")
@@ -405,9 +414,15 @@ def main():
 
     # Copy encoder and supporting files from input
     print("\nCopying supporting files...")
-    for filename in ["encoder.onnx", "embed_tokens.bin", "config.json",
-                     "tokenizer.json", "tokenizer_config.json",
-                     "added_tokens.json", "vocab.json"]:
+    for filename in [
+        "encoder.onnx",
+        "embed_tokens.bin",
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "added_tokens.json",
+        "vocab.json",
+    ]:
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
             dst = os.path.join(args.output, filename)

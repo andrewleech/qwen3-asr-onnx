@@ -37,8 +37,8 @@ Multiple quantization variants coexist in a single directory. The consumer selec
 
 | Model | Variant | WER | RTF (CPU) | tar.gz download |
 |---|---|---|---|---|
-| **0.6B** | int4 RTN al4 | 5.16% | 0.16x | 1.4 GB |
-| **1.7B** | int4 RTN al4 | 4.20% | 0.37x | 3.2 GB |
+| **0.6B** | int4 RTN al4 | 5.16% | 0.16x | 1.2 GB |
+| **1.7B** | int4 RTN al4 | 4.20% | 0.37x | 2.5 GB |
 | Parakeet-TDT 0.6B INT8 | reference | 5.45% | 0.16x | — |
 
 WER measured on LibriSpeech test-other (200 samples). RTF < 1.0 = faster than real-time.
@@ -49,14 +49,14 @@ Each int4 package contains the files needed for quantized inference:
 
 | Component | 0.6B | 1.7B | Format | Why this format |
 |---|---|---|---|---|
-| `encoder.int4.onnx` | 376 MB | 639 MB | **native FP16** | Autocast export — FP16 ops internally, FP32 I/O. Zero WER impact vs FP32 encoder |
-| `decoder_init.int4.onnx` | 835 MB | 1,954 MB | **int4** | MatMulNBits bs64 al4 (RTN for both sizes) |
-| `decoder_step.int4.onnx` | 325 MB | 937 MB | **int4** | RTN al4 for both sizes |
-| `decoder_weights.int4.data` | shared | shared | — | Single external weights file for both int4 decoders (same deduplication as FP32) |
-| `embed_tokens.bin` | 297 MB | 593 MB | **FP16** | Zero measured WER impact vs FP32. Consumer casts to FP32 at lookup time |
+| `encoder.int4.onnx` | 358 MB | 609 MB | **native FP16** | Autocast export — FP16 ops internally, FP32 I/O. Zero WER impact vs FP32 encoder |
+| `decoder_init.int4.onnx` | 2 MB | 2 MB | **int4** | Graph proto only — weights in shared data file |
+| `decoder_step.int4.onnx` | 87 MB | 171 MB | **int4** | Graph proto + inlined lm_head weights (unmatched between init/step) |
+| `decoder_weights.int4.data` | 833 MB | 1,953 MB | **int4** | Shared external weights for both decoders (RTN al4 bs64) |
+| `embed_tokens.bin` | 296 MB | 593 MB | **FP16** | Zero measured WER impact vs FP32. Consumer casts to FP32 at lookup time |
 | `config.json` + `tokenizer.json` | ~11 MB | ~11 MB | — | Architecture config, special tokens, mel params, tokenizer |
 
-Uncompressed total: 0.6B = 1.9 GB, 1.7B = 4.2 GB.
+Uncompressed total: 0.6B = 1.6 GB, 1.7B = 3.3 GB.
 
 The encoder uses a native FP16 export via `torch.amp.autocast` tracing. Unlike post-hoc FP16 conversion (which inserts Cast nodes and breaks quality), autocast tracing captures native FP16 ops while keeping precision-sensitive operations (LayerNorm, softmax) in FP32. The attention mask uses `torch.finfo(float16).min` = -65504 (valid FP16), avoiding the overflow that breaks post-hoc conversion. Result: half the FP32 encoder size with zero measured WER impact (verified on both 0.6B and 1.7B, 200-sample LibriSpeech test-other).
 
@@ -99,7 +99,7 @@ Measured on Ryzen AI 7 PRO 350 (WSL/Linux, ORT 1.22). Lower is better for both W
 - **AMD (Radeon 860M iGPU):** DirectML produces garbage output. WebGPU works but 3× slower than CPU. Shared memory architecture limits throughput.
 - **CPU int4 on a fast CPU still wins** — anl's Ryzen AI 7 PRO at 1.77s beats step's WebGPU at 1.83s.
 - FP16 models are slow on all GPU EPs due to ORT's Cast FP32→FP16 node overhead.
-- 1.7B int4 (~5.4 GB) exceeds 4 GB VRAM — GPU acceleration requires 8+ GB.
+- 1.7B int4 (~3.3 GB) fits in 4 GB VRAM but leaves little headroom for KV cache — GPU acceleration for 1.7B may require 6+ GB.
 
 ## Setup
 

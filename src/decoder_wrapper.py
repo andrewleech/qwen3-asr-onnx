@@ -22,7 +22,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # Qwen3-0.6B decoder dimensions (kept for test compatibility; wrappers read from text_config)
 NUM_LAYERS = 28
 NUM_Q_HEADS = 16
@@ -179,8 +178,10 @@ class DecoderInitWrapper(nn.Module):
 
         # Create causal attention mask: [1, 1, seq_len, seq_len]
         causal_mask = torch.full(
-            (seq_len, seq_len), torch.finfo(input_embeds.dtype).min,
-            device=input_embeds.device, dtype=input_embeds.dtype,
+            (seq_len, seq_len),
+            torch.finfo(input_embeds.dtype).min,
+            device=input_embeds.device,
+            dtype=input_embeds.dtype,
         )
         causal_mask = torch.triu(causal_mask, diagonal=1)
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
@@ -191,8 +192,13 @@ class DecoderInitWrapper(nn.Module):
 
         for layer in self.layers:
             hidden_states, key_states, value_states = _decoder_layer_forward(
-                layer, hidden_states, cos, sin, causal_mask,
-                past_key=None, past_value=None,
+                layer,
+                hidden_states,
+                cos,
+                sin,
+                causal_mask,
+                past_key=None,
+                past_value=None,
                 num_kv_groups=self.num_kv_groups,
             )
             all_keys.append(key_states)
@@ -264,8 +270,13 @@ class DecoderStepWrapper(nn.Module):
 
         for i, layer in enumerate(self.layers):
             hidden_states, key_states, value_states = _decoder_layer_forward(
-                layer, hidden_states, cos, sin, mask,
-                past_key=past_keys[i], past_value=past_values[i],
+                layer,
+                hidden_states,
+                cos,
+                sin,
+                mask,
+                past_key=past_keys[i],
+                past_value=past_values[i],
                 num_kv_groups=self.num_kv_groups,
             )
             all_keys.append(key_states)
@@ -335,6 +346,7 @@ def export_decoder_init(
         )
 
     from .onnx_fixup import fix_reshape_allowzero
+
     n = fix_reshape_allowzero(output_path)
     print(f"Decoder init exported to {output_path} (fixed {n} Reshape allowzero attrs)")
 
@@ -370,8 +382,12 @@ def export_decoder_step(
     dummy_pos = torch.tensor([[past_seq_len]], device=device, dtype=torch.long)
 
     # Stacked KV cache: [num_layers, batch, kv_heads, past_seq, head_dim]
-    dummy_past_keys = torch.randn(num_layers, 1, num_kv_heads, past_seq_len, head_dim, device=device, dtype=torch.float32)
-    dummy_past_values = torch.randn(num_layers, 1, num_kv_heads, past_seq_len, head_dim, device=device, dtype=torch.float32)
+    dummy_past_keys = torch.randn(
+        num_layers, 1, num_kv_heads, past_seq_len, head_dim, device=device, dtype=torch.float32
+    )
+    dummy_past_values = torch.randn(
+        num_layers, 1, num_kv_heads, past_seq_len, head_dim, device=device, dtype=torch.float32
+    )
 
     input_names = ["input_embeds", "position_ids", "past_keys", "past_values"]
     output_names = ["logits", "present_keys", "present_values"]
@@ -401,5 +417,6 @@ def export_decoder_step(
         )
 
     from .onnx_fixup import fix_reshape_allowzero
+
     n = fix_reshape_allowzero(output_path)
     print(f"Decoder step exported to {output_path} (fixed {n} Reshape allowzero attrs)")

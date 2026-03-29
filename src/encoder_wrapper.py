@@ -16,14 +16,11 @@ Input: mel spectrogram [1, 128, time]
 Output: audio features [1, tokens, output_dim]
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-CONV_WINDOW = 100       # n_window * 2
+CONV_WINDOW = 100  # n_window * 2
 TOKENS_PER_WINDOW = 13  # tokens output by conv on a full 100-frame window
 ATTN_WINDOW_SIZE = 104  # TOKENS_PER_WINDOW * (n_window_infer // conv_window) = 13 * 8
 
@@ -153,10 +150,10 @@ class EncoderWrapper(nn.Module):
 
         # [1, 128, T_padded] -> [N, 1, 128, CONV_WINDOW]
         assert mel.shape[0] == 1, f"Expected batch=1, got {mel.shape[0]}"
-        x = mel.squeeze(0)                                     # [128, T_padded]
-        x = x.reshape(128, num_conv_windows, CONV_WINDOW)      # [128, N, 100]
-        x = x.permute(1, 0, 2)                                 # [N, 128, 100]
-        x = x.unsqueeze(1)                                     # [N, 1, 128, 100]
+        x = mel.squeeze(0)  # [128, T_padded]
+        x = x.reshape(128, num_conv_windows, CONV_WINDOW)  # [128, N, 100]
+        x = x.permute(1, 0, 2)  # [N, 128, 100]
+        x = x.unsqueeze(1)  # [N, 1, 128, 100]
 
         # Conv2D stem
         x = F.gelu(self.conv2d1(x))
@@ -174,8 +171,8 @@ class EncoderWrapper(nn.Module):
 
         # --- Stage 2: Flatten and compute valid_count ---
         valid_count = _get_feat_extract_output_lengths(T)
-        flat = x.reshape(-1, self.d_model)     # [N * tpw, d_model]
-        flat = flat[:valid_count]               # trim conv-padding tokens
+        flat = x.reshape(-1, self.d_model)  # [N * tpw, d_model]
+        flat = flat[:valid_count]  # trim conv-padding tokens
 
         # --- Stage 3: Pad to multiple of ATTN_WINDOW_SIZE, reshape to windows ---
         attn_pad = (ATTN_WINDOW_SIZE - valid_count % ATTN_WINDOW_SIZE) % ATTN_WINDOW_SIZE
@@ -203,7 +200,7 @@ class EncoderWrapper(nn.Module):
         x = self.act(self.proj1(x))
         x = self.proj2(x)
 
-        return x  # [1, valid_count, output_dim]
+        return x  # type: ignore[no-any-return]  # [1, valid_count, output_dim]
 
 
 def export_encoder(
@@ -243,5 +240,6 @@ def export_encoder(
         )
 
     from .onnx_fixup import fix_reshape_allowzero
+
     n = fix_reshape_allowzero(output_path)
     print(f"Encoder exported to {output_path} (fixed {n} Reshape allowzero attrs)")

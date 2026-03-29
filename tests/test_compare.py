@@ -15,7 +15,6 @@ import os
 import re
 
 import numpy as np
-import onnxruntime as ort
 import pytest
 import soundfile as sf
 import torch
@@ -80,8 +79,7 @@ INT8_DIR = "output/qwen3-asr-0.6b-int8"
 # ---------------------------------------------------------------------------
 
 _fp32_available = all(
-    os.path.exists(os.path.join(FP32_DIR, f"{n}.onnx"))
-    for n in ["encoder", "decoder_init", "decoder_step"]
+    os.path.exists(os.path.join(FP32_DIR, f"{n}.onnx")) for n in ["encoder", "decoder_init", "decoder_step"]
 )
 _fixtures_available = all(os.path.exists(s["path"]) for s in SAMPLES)
 
@@ -91,8 +89,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 _int8_available = all(
-    os.path.exists(os.path.join(INT8_DIR, f"{n}.onnx"))
-    for n in ["encoder", "decoder_init", "decoder_step"]
+    os.path.exists(os.path.join(INT8_DIR, f"{n}.onnx")) for n in ["encoder", "decoder_init", "decoder_step"]
 )
 
 slow = pytest.mark.slow
@@ -102,10 +99,12 @@ slow = pytest.mark.slow
 # Fixtures (module-scoped, loaded once)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def pytorch_model():
     try:
         from transformers import AutoModel
+
         model = AutoModel.from_pretrained(
             "Qwen/Qwen3-ASR-0.6B",
             torch_dtype=torch.float32,
@@ -116,8 +115,11 @@ def pytorch_model():
         from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
             Qwen3ASRForConditionalGeneration,
         )
+
         model = Qwen3ASRForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen3-ASR-0.6B", torch_dtype=torch.float32, device_map="cpu",
+            "Qwen/Qwen3-ASR-0.6B",
+            torch_dtype=torch.float32,
+            device_map="cpu",
         )
     model.eval()
     return model
@@ -128,13 +130,15 @@ def processor():
     from qwen_asr.core.transformers_backend.processing_qwen3_asr import (
         Qwen3ASRProcessor,
     )
+
     return Qwen3ASRProcessor.from_pretrained("Qwen/Qwen3-ASR-0.6B")
 
 
 @pytest.fixture(scope="module")
 def tokenizer():
     return AutoTokenizer.from_pretrained(
-        "Qwen/Qwen3-ASR-0.6B", trust_remote_code=True,
+        "Qwen/Qwen3-ASR-0.6B",
+        trust_remote_code=True,
     )
 
 
@@ -155,7 +159,8 @@ def _load_embed(onnx_dir):
         cfg = json.load(f)
     dtype = np.dtype(cfg.get("embed_tokens_dtype", "float32"))
     embed = np.fromfile(
-        os.path.join(onnx_dir, "embed_tokens.bin"), dtype=dtype,
+        os.path.join(onnx_dir, "embed_tokens.bin"),
+        dtype=dtype,
     ).reshape(cfg["embed_tokens_shape"])
     return embed.astype(np.float32)
 
@@ -183,15 +188,16 @@ def _load_audio(path):
     audio, sr = sf.read(path, dtype="float32")
     if sr != 16000:
         import librosa
+
         audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     return audio
 
 
-def _get_results(sample, pytorch_model, processor, tokenizer,
-                 fp32_sessions, fp32_embed,
-                 int8_sessions=None, int8_embed=None):
+def _get_results(
+    sample, pytorch_model, processor, tokenizer, fp32_sessions, fp32_embed, int8_sessions=None, int8_embed=None
+):
     """Run all inference paths for a sample, caching results."""
     name = sample["name"]
     if name in _result_cache:
@@ -215,6 +221,7 @@ def _get_results(sample, pytorch_model, processor, tokenizer,
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _extract_words(text):
     """Normalize text to uppercase words only (strip punctuation)."""
     text = strip_asr_prefix(text)
@@ -237,40 +244,55 @@ _long_ids = [s["name"] for s in _long_samples]
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestTokenCounts:
     @pytest.mark.parametrize("sample", SAMPLES, ids=_sample_ids)
     def test_audio_token_counts_consistent(
-        self, sample, pytorch_model, processor, tokenizer,
-        fp32_sessions, fp32_embed,
+        self,
+        sample,
+        pytorch_model,
+        processor,
+        tokenizer,
+        fp32_sessions,
+        fp32_embed,
     ):
         """Wrapper, FP32 (and INT8 if available) produce the same audio_token_count."""
         results = _get_results(
-            sample, pytorch_model, processor, tokenizer,
-            fp32_sessions, fp32_embed,
+            sample,
+            pytorch_model,
+            processor,
+            tokenizer,
+            fp32_sessions,
+            fp32_embed,
         )
         wrapper_count = results["wrapper"]["audio_token_count"]
         fp32_count = results["fp32"]["audio_token_count"]
-        assert wrapper_count == fp32_count, (
-            f"wrapper={wrapper_count} vs fp32={fp32_count}"
-        )
+        assert wrapper_count == fp32_count, f"wrapper={wrapper_count} vs fp32={fp32_count}"
 
         if "int8" in results:
             int8_count = results["int8"]["audio_token_count"]
-            assert wrapper_count == int8_count, (
-                f"wrapper={wrapper_count} vs int8={int8_count}"
-            )
+            assert wrapper_count == int8_count, f"wrapper={wrapper_count} vs int8={int8_count}"
 
 
 class TestWrapperFP32:
     @pytest.mark.parametrize("sample", SAMPLES, ids=_sample_ids)
     def test_tokens_exact(
-        self, sample, pytorch_model, processor, tokenizer,
-        fp32_sessions, fp32_embed,
+        self,
+        sample,
+        pytorch_model,
+        processor,
+        tokenizer,
+        fp32_sessions,
+        fp32_embed,
     ):
         """Wrapper and FP32 ONNX should produce identical generated tokens."""
         results = _get_results(
-            sample, pytorch_model, processor, tokenizer,
-            fp32_sessions, fp32_embed,
+            sample,
+            pytorch_model,
+            processor,
+            tokenizer,
+            fp32_sessions,
+            fp32_embed,
         )
         assert results["wrapper"]["tokens"] == results["fp32"]["tokens"], (
             f"wrapper tokens != fp32 tokens for {sample['name']}"
@@ -278,13 +300,22 @@ class TestWrapperFP32:
 
     @pytest.mark.parametrize("sample", SAMPLES, ids=_sample_ids)
     def test_encoder_feature_tolerance(
-        self, sample, pytorch_model, processor, tokenizer,
-        fp32_sessions, fp32_embed,
+        self,
+        sample,
+        pytorch_model,
+        processor,
+        tokenizer,
+        fp32_sessions,
+        fp32_embed,
     ):
         """Wrapper and FP32 encoder features should be within 1e-4."""
         results = _get_results(
-            sample, pytorch_model, processor, tokenizer,
-            fp32_sessions, fp32_embed,
+            sample,
+            pytorch_model,
+            processor,
+            tokenizer,
+            fp32_sessions,
+            fp32_embed,
         )
         wrapper_feat = results["wrapper"]["audio_features"]
         fp32_feat = results["fp32"]["audio_features"]
@@ -296,13 +327,22 @@ class TestWrapperFP32:
 class TestNative:
     @pytest.mark.parametrize("sample", _short_samples, ids=_short_ids)
     def test_matches_fp32_short(
-        self, sample, pytorch_model, processor, tokenizer,
-        fp32_sessions, fp32_embed,
+        self,
+        sample,
+        pytorch_model,
+        processor,
+        tokenizer,
+        fp32_sessions,
+        fp32_embed,
     ):
         """On short audio, native and FP32 should produce exact token match."""
         results = _get_results(
-            sample, pytorch_model, processor, tokenizer,
-            fp32_sessions, fp32_embed,
+            sample,
+            pytorch_model,
+            processor,
+            tokenizer,
+            fp32_sessions,
+            fp32_embed,
         )
         assert results["native"]["tokens"] == results["fp32"]["tokens"], (
             f"native tokens != fp32 tokens for {sample['name']}"
@@ -311,8 +351,13 @@ class TestNative:
     @slow
     @pytest.mark.parametrize("sample", _long_samples, ids=_long_ids)
     def test_matches_fp32_long_words(
-        self, sample, pytorch_model, processor, tokenizer,
-        fp32_sessions, fp32_embed,
+        self,
+        sample,
+        pytorch_model,
+        processor,
+        tokenizer,
+        fp32_sessions,
+        fp32_embed,
     ):
         """On long audio, native and FP32 should produce nearly identical words.
 
@@ -320,8 +365,12 @@ class TestNative:
         so we allow up to 5% word error rate rather than requiring exact equality.
         """
         results = _get_results(
-            sample, pytorch_model, processor, tokenizer,
-            fp32_sessions, fp32_embed,
+            sample,
+            pytorch_model,
+            processor,
+            tokenizer,
+            fp32_sessions,
+            fp32_embed,
         )
         native_words = _extract_words(results["native"]["text"])
         fp32_words = _extract_words(results["fp32"]["text"])
@@ -338,14 +387,26 @@ class TestNative:
 class TestINT8:
     @pytest.mark.parametrize("sample", _short_samples, ids=_short_ids)
     def test_short_matches_fp32(
-        self, sample, pytorch_model, processor, tokenizer,
-        fp32_sessions, fp32_embed, int8_sessions, int8_embed,
+        self,
+        sample,
+        pytorch_model,
+        processor,
+        tokenizer,
+        fp32_sessions,
+        fp32_embed,
+        int8_sessions,
+        int8_embed,
     ):
         """On short audio, INT8 should produce identical tokens to FP32."""
         results = _get_results(
-            sample, pytorch_model, processor, tokenizer,
-            fp32_sessions, fp32_embed,
-            int8_sessions, int8_embed,
+            sample,
+            pytorch_model,
+            processor,
+            tokenizer,
+            fp32_sessions,
+            fp32_embed,
+            int8_sessions,
+            int8_embed,
         )
         if "int8" not in results:
             pytest.skip("INT8 results not available")

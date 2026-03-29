@@ -17,9 +17,7 @@ import numpy as np
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert embed_tokens.bin from float32 to float16"
-    )
+    parser = argparse.ArgumentParser(description="Convert embed_tokens.bin from float32 to float16")
     parser.add_argument(
         "--model-dir",
         required=True,

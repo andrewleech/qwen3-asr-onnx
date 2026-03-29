@@ -20,8 +20,7 @@ import sys
 from collections import defaultdict
 
 import onnx
-from onnx import TensorProto, helper, numpy_helper
-import numpy as np
+from onnx import helper, numpy_helper
 
 
 def build_maps(graph):
@@ -262,6 +261,7 @@ def main():
     onnx.save(model, args.output)
 
     import os
+
     orig_size = os.path.getsize(args.input)
     new_size = os.path.getsize(args.output)
     print(f"Size: {orig_size / 1e6:.1f} MB -> {new_size / 1e6:.1f} MB")

@@ -37,12 +37,12 @@ import shutil
 
 import numpy as np
 import onnx
+from onnxruntime.quantization.calibrate import CalibrationDataReader
 from onnxruntime.quantization.matmul_nbits_quantizer import (
     GPTQWeightOnlyQuantConfig,
     MatMulNBitsQuantizer,
     RTNWeightOnlyQuantConfig,
 )
-from onnxruntime.quantization.calibrate import CalibrationDataReader
 from onnxruntime.quantization.quant_utils import QuantFormat
 
 
@@ -55,7 +55,7 @@ class NpzCalibrationReader(CalibrationDataReader):
         self._data: list[dict] = []
         for i in range(n):
             prefix = f"{i}_"
-            sample_keys = [k[len(prefix):] for k in data.files if k.startswith(prefix)]
+            sample_keys = [k[len(prefix) :] for k in data.files if k.startswith(prefix)]
             self._data.append({k: data[f"{prefix}{k}"] for k in sample_keys})
         self._idx = 0
 
@@ -110,6 +110,7 @@ def quantize_decoder(
 
         # ORT >=1.23 removed the `bits` parameter (always 4-bit); older versions require it.
         import inspect
+
         sig = inspect.signature(MatMulNBitsQuantizer.__init__)
         kwargs = dict(
             model=model_arg,
@@ -192,7 +193,6 @@ def main():
         quantize_decoder(src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data)
         quantized_names.add(name)
 
-
     # Copy non-quantized files from input to output (encoder, tokenizer, config, etc.)
     # Skip if input == output (in-place quantization).
     if os.path.realpath(args.input) != os.path.realpath(args.output):
@@ -226,17 +226,23 @@ def main():
         print(f"  Updated config.json: quantization={json.dumps(quant_info)}")
 
     # Report sizes
-    in_mb = sum(
-        os.path.getsize(os.path.join(args.input, f))
-        for f in os.listdir(args.input)
-        if os.path.isfile(os.path.join(args.input, f))
-    ) / 1024**2
-    out_mb = sum(
-        os.path.getsize(os.path.join(args.output, f))
-        for f in os.listdir(args.output)
-        if os.path.isfile(os.path.join(args.output, f))
-    ) / 1024**2
-    print(f"\nDone.")
+    in_mb = (
+        sum(
+            os.path.getsize(os.path.join(args.input, f))
+            for f in os.listdir(args.input)
+            if os.path.isfile(os.path.join(args.input, f))
+        )
+        / 1024**2
+    )
+    out_mb = (
+        sum(
+            os.path.getsize(os.path.join(args.output, f))
+            for f in os.listdir(args.output)
+            if os.path.isfile(os.path.join(args.output, f))
+        )
+        / 1024**2
+    )
+    print("\nDone.")
     print(f"  Input:  {in_mb:.1f} MB")
     print(f"  Output: {out_mb:.1f} MB")
     print(f"  Ratio:  {out_mb / in_mb * 100:.1f}%")

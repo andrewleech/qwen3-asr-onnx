@@ -61,8 +61,10 @@ def convert_weights_fp16(input_path: str, output_path: str) -> tuple[int, int]:
         # Check for values outside FP16 range
         max_abs = float(np.abs(data).max())
         if max_abs > 65504.0:
-            print(f"  WARNING: {tensor.name}: max |value| = {max_abs:.1f} "
-                  f"(exceeds FP16 max 65504) — will be clamped to inf")
+            print(
+                f"  WARNING: {tensor.name}: max |value| = {max_abs:.1f} "
+                f"(exceeds FP16 max 65504) — will be clamped to inf"
+            )
 
         # Convert weight data to FP16
         data_fp16 = data.astype(np.float16)
@@ -148,9 +150,7 @@ def verify_ort_load(model_path: str) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert ONNX weights to FP16 storage with Cast nodes (FP32 compute)"
-    )
+    parser = argparse.ArgumentParser(description="Convert ONNX weights to FP16 storage with Cast nodes (FP32 compute)")
     parser.add_argument("--input", required=True, help="Input ONNX file")
     parser.add_argument("--output", required=True, help="Output ONNX file")
     parser.add_argument("--verify", action="store_true", help="Verify ORT can load result")

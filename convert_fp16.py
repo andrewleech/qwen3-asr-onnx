@@ -30,7 +30,7 @@ def convert_model_fp16(input_path: str, output_path: str) -> None:
     print(f"  Loading {os.path.basename(input_path)}...")
     model = onnx.load(input_path, load_external_data=True)
 
-    print(f"    Converting graph to FP16...")
+    print("    Converting graph to FP16...")
     model_fp16 = convert_float_to_float16(
         model,
         keep_io_types=True,  # Keep inputs/outputs as float32 for compatibility
@@ -97,9 +97,15 @@ def main():
 
     # Copy non-converted files
     print("\nCopying supporting files...")
-    for filename in ["encoder.onnx", "embed_tokens.bin", "config.json",
-                     "tokenizer.json", "tokenizer_config.json",
-                     "added_tokens.json", "vocab.json"]:
+    for filename in [
+        "encoder.onnx",
+        "embed_tokens.bin",
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "added_tokens.json",
+        "vocab.json",
+    ]:
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
             dst = os.path.join(args.output, filename)

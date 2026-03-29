@@ -24,10 +24,8 @@ import argparse
 import hashlib
 import mmap
 import os
-import sys
 
 import onnx
-
 
 SHARED_DATA_NAME = "decoder_weights.data"
 
@@ -77,7 +75,7 @@ def inline_tensor(tensor, data):
 
 def hash_data(mm, offset, length):
     """Compute SHA-256 of a region in a memory-mapped file."""
-    return hashlib.sha256(mm[offset:offset + length]).hexdigest()
+    return hashlib.sha256(mm[offset : offset + length]).hexdigest()
 
 
 def build_init_index(init_model, data_mm):
@@ -114,13 +112,13 @@ def share_external_models(model_dir, suffix=None):
         return True
 
     if not os.path.exists(init_data_path) or not os.path.exists(step_data_path):
-        print(f"  External data files missing — trying inline path")
+        print("  External data files missing — trying inline path")
         return share_inline_models(model_dir, suffix=suffix)
 
     step_data_size = os.path.getsize(step_data_path)
     init_data_size = os.path.getsize(init_data_path)
 
-    print(f"  Loading protos (no external data)...")
+    print("  Loading protos (no external data)...")
     init_model = onnx.load(init_proto_path, load_external_data=False)
     step_model = onnx.load(step_proto_path, load_external_data=False)
 
@@ -158,7 +156,7 @@ def share_external_models(model_dir, suffix=None):
                 matched_bytes += length
             else:
                 # Unmatched: inline into proto (these are small constants)
-                data = step_mm[offset:offset + length]
+                data = step_mm[offset : offset + length]
                 inline_tensor(tensor, data)
                 inlined += 1
 
@@ -177,7 +175,7 @@ def share_external_models(model_dir, suffix=None):
     os.rename(init_data_path, shared_data_path)
 
     # Save both protos
-    print(f"  Saving updated protos...")
+    print("  Saving updated protos...")
     with open(init_proto_path, "wb") as f:
         f.write(init_model.SerializeToString())
     with open(step_proto_path, "wb") as f:
@@ -191,7 +189,7 @@ def share_external_models(model_dir, suffix=None):
     step_proto_size = os.path.getsize(step_proto_path)
     shared_size = os.path.getsize(shared_data_path)
 
-    print(f"\n  Results:")
+    print("\n  Results:")
     print(f"    Matched:  {matched} tensors ({matched_bytes / 1e9:.2f} GB)")
     print(f"    Inlined:  {inlined} tensors (small constants)")
     print(f"    Shared data:  {shared_size / 1e9:.2f} GB ({shared_name})")
@@ -209,11 +207,11 @@ def share_inline_models(model_dir, suffix=None):
     step_proto_path = os.path.join(model_dir, step_name)
     shared_data_path = os.path.join(model_dir, shared_name)
 
-    print(f"  Loading init model with inline data...")
+    print("  Loading init model with inline data...")
     init_model = onnx.load(init_proto_path)
 
     # Convert init to external data format
-    print(f"  Converting init to external data format...")
+    print("  Converting init to external data format...")
     onnx.external_data_helper.convert_model_to_external_data(
         init_model,
         all_tensors_to_one_file=True,
@@ -223,21 +221,21 @@ def share_inline_models(model_dir, suffix=None):
     )
 
     # Save init (writes shared data file)
-    print(f"  Saving init with external data...")
+    print("  Saving init with external data...")
     onnx.save(init_model, init_proto_path)
 
     # Reload init proto to get offsets
     init_model = onnx.load(init_proto_path, load_external_data=False)
 
     # Build init hash index from the new shared data file
-    print(f"  Indexing init weights...")
+    print("  Indexing init weights...")
     with open(shared_data_path, "rb") as f:
         init_mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         init_index = build_init_index(init_model, init_mm)
         init_mm.close()
 
     # Load step model with full data
-    print(f"  Loading step model with inline data...")
+    print("  Loading step model with inline data...")
     step_model = onnx.load(step_proto_path)
 
     # Match step tensors against init
@@ -260,7 +258,7 @@ def share_inline_models(model_dir, suffix=None):
             inlined_kept += 1
 
     # Save step proto only (no data file written)
-    print(f"  Saving step proto...")
+    print("  Saving step proto...")
     with open(step_proto_path, "wb") as f:
         f.write(step_model.SerializeToString())
 
@@ -274,7 +272,7 @@ def share_inline_models(model_dir, suffix=None):
     step_proto_size = os.path.getsize(step_proto_path)
     shared_size = os.path.getsize(shared_data_path)
 
-    print(f"\n  Results:")
+    print("\n  Results:")
     print(f"    Matched:  {matched} tensors ({matched_bytes / 1e9:.2f} GB)")
     print(f"    Kept inline:  {inlined_kept} tensors")
     print(f"    Shared data:  {shared_size / 1e9:.2f} GB ({shared_name})")
@@ -306,8 +304,6 @@ def verify_inference(model_dir, suffix=None):
         print("  onnxruntime not available, skipping inference check")
         return True
 
-    import numpy as np
-
     init_name, step_name = _decoder_filenames(suffix)
     init_path = os.path.join(model_dir, init_name)
     step_path = os.path.join(model_dir, step_name)
@@ -317,10 +313,10 @@ def verify_inference(model_dir, suffix=None):
 
     try:
         print(f"  Loading {init_name} in ORT...")
-        init_sess = ort.InferenceSession(init_path, opts)
+        ort.InferenceSession(init_path, opts)
         print(f"  Loading {step_name} in ORT...")
-        step_sess = ort.InferenceSession(step_path, opts)
-        print(f"  Both sessions loaded successfully")
+        ort.InferenceSession(step_path, opts)
+        print("  Both sessions loaded successfully")
         return True
     except Exception as e:
         print(f"  ORT load FAILED: {e}")
@@ -328,9 +324,7 @@ def verify_inference(model_dir, suffix=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Share external weight data between split decoder models"
-    )
+    parser = argparse.ArgumentParser(description="Share external weight data between split decoder models")
     parser.add_argument(
         "model_dir",
         help="Directory containing decoder_init.onnx and decoder_step.onnx",
@@ -370,12 +364,12 @@ def main():
         ok = share_external_models(model_dir, suffix=args.suffix)
 
         if ok and args.verify:
-            print(f"\n  Verification:")
+            print("\n  Verification:")
             verify_model(model_dir, init_name)
             verify_model(model_dir, step_name)
             verify_inference(model_dir, suffix=args.suffix)
 
-    print(f"\nDone.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":

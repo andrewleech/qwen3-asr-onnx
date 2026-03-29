@@ -70,6 +70,7 @@ def load_embed(model_dir: str) -> np.ndarray:
 def stream_audio(n: int):
     """Yield float32 16kHz audio arrays from LibriSpeech test-other (streaming)."""
     import io
+
     import soundfile as sf
     from datasets import Audio, load_dataset
 
@@ -97,6 +98,7 @@ def stream_audio(n: int):
             arr = arr.mean(axis=1)
         if sr != 16000:
             import librosa
+
             arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
         yield arr.astype(np.float32)
         yielded += 1
@@ -110,7 +112,7 @@ def collect_init_inputs(sessions, embed_tokens, n_samples, verbose=True):
     inputs = []
     for i, audio in enumerate(stream_audio(n_samples)):
         if verbose:
-            print(f"  [{i+1}/{n_samples}] {len(audio)/16000:.1f}s audio", flush=True)
+            print(f"  [{i + 1}/{n_samples}] {len(audio) / 16000:.1f}s audio", flush=True)
 
         mel = log_mel_spectrogram(audio)
         mel_np = mel.cpu().numpy()
@@ -126,12 +128,14 @@ def collect_init_inputs(sessions, embed_tokens, n_samples, verbose=True):
         position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
         audio_offset = np.array([audio_start], dtype=np.int64)
 
-        inputs.append({
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "audio_features": audio_features,
-            "audio_offset": audio_offset,
-        })
+        inputs.append(
+            {
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "audio_features": audio_features,
+                "audio_offset": audio_offset,
+            }
+        )
 
     return inputs
 
@@ -139,12 +143,12 @@ def collect_init_inputs(sessions, embed_tokens, n_samples, verbose=True):
 def collect_step_inputs(sessions, embed_tokens, n_samples, decoder_steps, verbose=True):
     """Collect decoder_step input dicts (with real KV cache) from n_samples audio files."""
     from src.mel import log_mel_spectrogram
-    from src.prompt import build_prompt_ids, get_audio_pad_range, EOS_TOKEN_IDS
+    from src.prompt import EOS_TOKEN_IDS, build_prompt_ids, get_audio_pad_range
 
     inputs = []
     for i, audio in enumerate(stream_audio(n_samples)):
         if verbose:
-            print(f"  [{i+1}/{n_samples}] {len(audio)/16000:.1f}s audio", flush=True)
+            print(f"  [{i + 1}/{n_samples}] {len(audio) / 16000:.1f}s audio", flush=True)
 
         mel = log_mel_spectrogram(audio)
         mel_np = mel.cpu().numpy()
@@ -181,12 +185,14 @@ def collect_step_inputs(sessions, embed_tokens, n_samples, decoder_steps, verbos
             step_embed = embed_tokens[next_token][np.newaxis, np.newaxis, :]
             step_pos = np.array([[pos]], dtype=np.int64)
 
-            inputs.append({
-                "input_embeds": step_embed,
-                "position_ids": step_pos,
-                "past_keys": keys,
-                "past_values": values,
-            })
+            inputs.append(
+                {
+                    "input_embeds": step_embed,
+                    "position_ids": step_pos,
+                    "past_keys": keys,
+                    "past_values": values,
+                }
+            )
 
             if step < decoder_steps - 1:
                 logits, keys, values = sessions["decoder_step"].run(

@@ -23,10 +23,9 @@ from transformers import AutoModel, AutoTokenizer
 from src.inference import greedy_decode_onnx
 from src.mel import log_mel_spectrogram
 from src.prompt import (
+    EOS_TOKEN_IDS,
     build_prompt_ids,
     get_audio_pad_range,
-    EOS_TOKEN_IDS,
-    AUDIO_PAD_TOKEN_ID,
 )
 
 
@@ -44,6 +43,7 @@ def load_pytorch_model(model_id: str, device: str = "cpu"):
         from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
             Qwen3ASRForConditionalGeneration,
         )
+
         model = Qwen3ASRForConditionalGeneration.from_pretrained(
             model_id,
             torch_dtype=torch.float32,
@@ -89,7 +89,7 @@ def load_embed_tokens(onnx_dir: str) -> np.ndarray:
 def run_encoder_onnx(session, mel: np.ndarray) -> np.ndarray:
     """Run encoder through ONNX Runtime."""
     result = session.run(["audio_features"], {"mel": mel})
-    return result[0]
+    return result[0]  # type: ignore[no-any-return]
 
 
 def run_encoder_pytorch(model, mel: torch.Tensor) -> torch.Tensor:
@@ -99,7 +99,7 @@ def run_encoder_pytorch(model, mel: torch.Tensor) -> torch.Tensor:
     wrapper = EncoderWrapper(model.thinker.audio_tower).eval()
     wrapper = wrapper.to(mel.device)
     with torch.no_grad():
-        return wrapper(mel)
+        return wrapper(mel)  # type: ignore[no-any-return]
 
 
 def greedy_decode_pytorch(
@@ -224,17 +224,13 @@ def validate_pipeline(model, sessions, embed_tokens, audio_features_pt, audio_fe
     # PyTorch decode
     print("  Running PyTorch decode...")
     t0 = time.time()
-    pt_tokens = greedy_decode_pytorch(
-        model, audio_features_pt, prompt_ids, device=device
-    )
+    pt_tokens = greedy_decode_pytorch(model, audio_features_pt, prompt_ids, device=device)
     pt_time = time.time() - t0
 
     # ONNX decode
     print("  Running ONNX decode...")
     t0 = time.time()
-    onnx_tokens = greedy_decode_onnx(
-        sessions, embed_tokens, audio_features_onnx, prompt_ids
-    )
+    onnx_tokens = greedy_decode_onnx(sessions, embed_tokens, audio_features_onnx, prompt_ids)
     onnx_time = time.time() - t0
 
     # Decode to text
@@ -247,9 +243,7 @@ def validate_pipeline(model, sessions, embed_tokens, audio_features_pt, audio_fe
     print(f"    {onnx_text}")
 
     # Compare token-by-token
-    match_count = sum(
-        1 for a, b in zip(pt_tokens, onnx_tokens) if a == b
-    )
+    match_count = sum(1 for a, b in zip(pt_tokens, onnx_tokens) if a == b)
     total = max(len(pt_tokens), len(onnx_tokens))
     print(f"\n  Token match: {match_count}/{total}")
 
@@ -280,10 +274,11 @@ def main():
     audio, sr = sf.read(args.audio, dtype="float32")
     if sr != 16000:
         import librosa
+
         audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
-    print(f"  Audio: {len(audio)/16000:.1f}s, {len(audio)} samples")
+    print(f"  Audio: {len(audio) / 16000:.1f}s, {len(audio)} samples")
 
     # Compute mel spectrogram
     print("Computing mel spectrogram...")
@@ -306,9 +301,7 @@ def main():
 
     # Validate encoder
     if "encoder" in sessions:
-        pt_features, onnx_features = validate_encoder(
-            model, sessions, mel_np, mel_torch, args.device
-        )
+        pt_features, onnx_features = validate_encoder(model, sessions, mel_np, mel_torch, args.device)
     else:
         print("\nSkipping encoder validation (no encoder.onnx)")
         pt_features = run_encoder_pytorch(model, mel_torch).cpu().numpy()
@@ -318,9 +311,13 @@ def main():
     if "decoder_init" in sessions and "decoder_step" in sessions:
         pt_features_torch = torch.from_numpy(pt_features).to(args.device)
         validate_pipeline(
-            model, sessions, embed_tokens,
-            pt_features_torch, onnx_features,
-            tokenizer, args.device,
+            model,
+            sessions,
+            embed_tokens,
+            pt_features_torch,
+            onnx_features,
+            tokenizer,
+            args.device,
         )
     else:
         print("\nSkipping pipeline validation (missing decoder ONNX files)")

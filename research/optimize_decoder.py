@@ -81,8 +81,7 @@ def check_contrib_ops(model):
     return contrib_ops
 
 
-def optimize_model(input_path, output_path, num_heads=0, hidden_size=0,
-                   disable_fusions=None, model_type="bert"):
+def optimize_model(input_path, output_path, num_heads=0, hidden_size=0, disable_fusions=None, model_type="bert"):
     """Run ORT Transformer Optimizer on a model."""
     from onnxruntime.transformers import optimizer as ort_optimizer
     from onnxruntime.transformers.fusion_options import FusionOptions
@@ -110,8 +109,7 @@ def optimize_model(input_path, output_path, num_heads=0, hidden_size=0,
             else:
                 print(f"  Warning: could not find fusion option for '{fusion}'")
 
-    print(f"Running optimizer (model_type={model_type}, "
-          f"num_heads={num_heads}, hidden_size={hidden_size})...")
+    print(f"Running optimizer (model_type={model_type}, num_heads={num_heads}, hidden_size={hidden_size})...")
     t0 = time.time()
 
     try:
@@ -138,7 +136,7 @@ def optimize_model(input_path, output_path, num_heads=0, hidden_size=0,
     # Check for contrib ops
     contrib = check_contrib_ops(opt_model)
     if contrib:
-        print(f"\n  Contrib/non-standard ops in optimized model:")
+        print("\n  Contrib/non-standard ops in optimized model:")
         for op in sorted(contrib):
             print(f"    {op}")
 
@@ -174,7 +172,7 @@ def verify_with_ort(model_path):
     print(f"\n  ORT load test: {os.path.basename(model_path)}")
     try:
         sess = ort.InferenceSession(model_path, opts)
-        print(f"    Loaded successfully")
+        print("    Loaded successfully")
         print(f"    Inputs:  {[i.name for i in sess.get_inputs()]}")
         print(f"    Outputs: {[o.name for o in sess.get_outputs()]}")
         return True
@@ -184,29 +182,35 @@ def verify_with_ort(model_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="ORT Transformer Optimizer investigation for Qwen3-ASR"
-    )
+    parser = argparse.ArgumentParser(description="ORT Transformer Optimizer investigation for Qwen3-ASR")
     parser.add_argument("--input", required=True, help="Input ONNX model path")
     parser.add_argument("--output", required=True, help="Output optimized model path")
     parser.add_argument(
-        "--num-heads", type=int, default=0,
+        "--num-heads",
+        type=int,
+        default=0,
         help="Number of attention heads (0 = auto-detect)",
     )
     parser.add_argument(
-        "--hidden-size", type=int, default=0,
+        "--hidden-size",
+        type=int,
+        default=0,
         help="Hidden size (0 = auto-detect)",
     )
     parser.add_argument(
-        "--model-type", default="bert",
+        "--model-type",
+        default="bert",
         help="Model type for optimizer (bert, gpt2, etc.)",
     )
     parser.add_argument(
-        "--disable-fusions", nargs="*", default=None,
+        "--disable-fusions",
+        nargs="*",
+        default=None,
         help="Fusion types to disable (e.g., SimplifiedLayerNormalization)",
     )
     parser.add_argument(
-        "--skip-ort-test", action="store_true",
+        "--skip-ort-test",
+        action="store_true",
         help="Skip ORT load verification",
     )
     args = parser.parse_args()

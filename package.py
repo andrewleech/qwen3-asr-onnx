@@ -27,7 +27,6 @@ import subprocess
 
 import numpy as np
 
-
 # FP32 model files (encoder weights inlined, decoder weights external)
 FP32_FILES = [
     "encoder.onnx",
@@ -134,9 +133,7 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     """Package FP32 + int4 variants from consolidated input directory."""
 
     if os.path.exists(output_dir):
-        assert os.path.realpath(output_dir) != os.path.realpath(input_dir), (
-            f"output must differ from input"
-        )
+        assert os.path.realpath(output_dir) != os.path.realpath(input_dir), "output must differ from input"
         print(f"Removing existing output: {output_dir}")
         shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -160,10 +157,11 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     # Share FP32 decoder weights — eliminates duplicate data between init and step.
     # Both protos reference a single decoder_weights.data file.
     from share_weights import share_external_models
+
     init_data = os.path.join(output_dir, "decoder_init.onnx.data")
     step_data = os.path.join(output_dir, "decoder_step.onnx.data")
     if os.path.exists(init_data) and os.path.exists(step_data):
-        print(f"\nSharing FP32 decoder weights:")
+        print("\nSharing FP32 decoder weights:")
         saved = os.path.getsize(step_data)
         share_external_models(output_dir)
         fp32_total -= saved
@@ -173,7 +171,7 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     init_int4_data = os.path.join(output_dir, "decoder_init.int4.onnx.data")
     step_int4_data = os.path.join(output_dir, "decoder_step.int4.onnx.data")
     if os.path.exists(init_int4_data) and os.path.exists(step_int4_data):
-        print(f"\nSharing int4 decoder weights:")
+        print("\nSharing int4 decoder weights:")
         saved = os.path.getsize(step_int4_data)
         share_external_models(output_dir, suffix="int4")
         int4_total -= saved
@@ -185,12 +183,12 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     fp16_src = os.path.join(input_dir, "embed_tokens.fp16.bin")
     fp32_src = os.path.join(input_dir, "embed_tokens.bin")
     embed_dst = os.path.join(output_dir, "embed_tokens.bin")
-    print(f"\nEmbed tokens:")
+    print("\nEmbed tokens:")
     if os.path.exists(fp16_src):
         embed_total += copy_file(fp16_src, embed_dst, hardlink=False)  # never hardlink (different name)
-        print(f"    (copied FP16 as embed_tokens.bin)")
+        print("    (copied FP16 as embed_tokens.bin)")
     elif os.path.exists(fp32_src):
-        print(f"    Converting FP32 → FP16...")
+        print("    Converting FP32 → FP16...")
         data = np.fromfile(fp32_src, dtype=np.float32)
         data.astype(np.float16).tofile(embed_dst)
         embed_total += os.path.getsize(embed_dst)
@@ -211,7 +209,7 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
             with open(tmp, "w") as f:
                 json.dump(cfg, f, indent=2)
             os.replace(tmp, config_dst)
-            print(f"    Set embed_tokens_dtype=float16 in config.json")
+            print("    Set embed_tokens_dtype=float16 in config.json")
 
     shared_total += embed_total
 
@@ -220,7 +218,7 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         test_wavs_dir = os.path.join(output_dir, "test_wavs")
         os.makedirs(test_wavs_dir, exist_ok=True)
         dst = os.path.join(test_wavs_dir, "0.wav")
-        print(f"\nTest audio:")
+        print("\nTest audio:")
         wav_size = copy_file(test_wavs_src, dst)
         shared_total += wav_size
 
@@ -230,12 +228,11 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     print(f"  FP32 variant:  {format_size(fp32_total + shared_total)}")
     if has_int4:
         print(f"  int4 variant:  {format_size(int4_total + shared_total)}")
-    total = sum(os.path.getsize(os.path.join(dp, f))
-                for dp, _, fns in os.walk(output_dir) for f in fns)
+    total = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fns in os.walk(output_dir) for f in fns)
     print(f"  Total on disk: {format_size(total)}")
 
     # ORT verification
-    print(f"\nVerifying ORT load:")
+    print("\nVerifying ORT load:")
     if not verify_ort_load(output_dir):
         print("ERROR: ORT verification failed")
         return False
@@ -248,11 +245,14 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     shared_names.append("embed_tokens.bin")
 
     # FP32 variant: encoder.onnx + decoder*.onnx + decoder_weights.data (shared)
-    fp32_variant_files = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx",
-                          "decoder_weights.data"]
+    fp32_variant_files = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx", "decoder_weights.data"]
     # int4 variant: encoder.int4.onnx + decoder*.int4.onnx + decoder_weights.int4.data (shared)
-    int4_variant_files = ["encoder.int4.onnx", "decoder_init.int4.onnx", "decoder_step.int4.onnx",
-                          "decoder_weights.int4.data"]
+    int4_variant_files = [
+        "encoder.int4.onnx",
+        "decoder_init.int4.onnx",
+        "decoder_step.int4.onnx",
+        "decoder_weights.int4.data",
+    ]
 
     for variant, file_list in [("", fp32_variant_files), ("-int4", int4_variant_files)]:
         if variant == "-int4" and not has_int4:
@@ -261,8 +261,7 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         tar_name = f"{archive_name}.tar.gz"
         tar_path = os.path.join(tar_dir, tar_name)
         # Filter to files that exist in the release dir
-        members = [f for f in file_list + shared_names
-                    if os.path.exists(os.path.join(output_dir, f))]
+        members = [f for f in file_list + shared_names if os.path.exists(os.path.join(output_dir, f))]
         tar_members = [f"{base_name}/{f}" for f in members]
 
         print(f"\nCreating {tar_name}...")
@@ -289,24 +288,19 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Package FP32 + int4 models from consolidated output directory"
-    )
+    parser = argparse.ArgumentParser(description="Package FP32 + int4 models from consolidated output directory")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--model", choices=["0.6b", "1.7b"],
-        help="Model size (resolves to output/qwen3-asr-{size}/)"
-    )
-    group.add_argument(
-        "--input", help="Explicit input directory"
-    )
+    group.add_argument("--model", choices=["0.6b", "1.7b"], help="Model size (resolves to output/qwen3-asr-{size}/)")
+    group.add_argument("--input", help="Explicit input directory")
     parser.add_argument("--output", required=True, help="Output release directory")
     parser.add_argument(
-        "--test-wavs", default=None,
+        "--test-wavs",
+        default=None,
         help="WAV file to include as test_wavs/0.wav",
     )
     parser.add_argument(
-        "--hardlink", action="store_true",
+        "--hardlink",
+        action="store_true",
         help="Use hardlinks instead of copies (saves disk space, same filesystem only)",
     )
     args = parser.parse_args()

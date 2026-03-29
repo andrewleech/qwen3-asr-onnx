@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from src.prompt import get_audio_pad_range, EOS_TOKEN_IDS
+from src.prompt import EOS_TOKEN_IDS, get_audio_pad_range
 
 
 def greedy_decode_onnx(
@@ -56,10 +56,7 @@ def greedy_decode_onnx(
         audio_start, audio_end = get_audio_pad_range(prompt_ids)
         audio_len = audio_end - audio_start
         if audio_features.shape[1] != audio_len:
-            raise ValueError(
-                f"Audio feature length {audio_features.shape[1]} != "
-                f"audio_pad count {audio_len}"
-            )
+            raise ValueError(f"Audio feature length {audio_features.shape[1]} != audio_pad count {audio_len}")
         input_embeds[audio_start:audio_end] = audio_features[0]
         input_embeds = input_embeds[np.newaxis, :, :]
 

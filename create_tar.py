@@ -13,10 +13,8 @@ Usage:
 import argparse
 import os
 import subprocess
-import sys
 
 from huggingface_hub import HfApi
-
 
 # Shared metadata files included in every archive
 METADATA = ["embed_tokens.bin", "config.json", "tokenizer.json"]
@@ -46,6 +44,8 @@ ARCHIVES = [
             "decoder_weights.int4.data",
         ],
     },
+    # NOTE: decoder_weights.int4.data is the shared external data file
+    # produced by share_weights.py — replaces per-file .onnx.data files
     {
         "name": "qwen3-asr-1.7b",
         "source_dir": "release/qwen3-asr-1.7b",
@@ -102,15 +102,13 @@ def create_tar(archive, output_dir):
     print(f"  Creating {tar_path}...")
     with open(tar_path, "wb") as f:
         tar_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-        gz_proc = subprocess.Popen(
-            ["gzip", "-1"], stdin=tar_proc.stdout, stdout=f
-        )
+        gz_proc = subprocess.Popen(["gzip", "-1"], stdin=tar_proc.stdout, stdout=f)
         tar_proc.stdout.close()
         gz_proc.wait()
         tar_proc.wait()
 
     if tar_proc.returncode != 0 or gz_proc.returncode != 0:
-        print(f"  ERROR: tar/gzip failed")
+        print("  ERROR: tar/gzip failed")
         return None
 
     size = os.path.getsize(tar_path)
@@ -128,25 +126,14 @@ def upload_tar(tar_path, repo, filename):
         repo_id=repo,
         commit_message=f"Add {filename}",
     )
-    print(f"  Upload complete")
+    print("  Upload complete")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Create and upload tar.gz archives for Handy"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Create archives and show sizes, don't upload or delete"
-    )
-    parser.add_argument(
-        "--output-dir", default="/tmp",
-        help="Directory for temporary tar.gz files (default: /tmp)"
-    )
-    parser.add_argument(
-        "--only", default=None,
-        help="Only process this archive name (e.g. qwen3-asr-0.6b-int4)"
-    )
+    parser = argparse.ArgumentParser(description="Create and upload tar.gz archives for Handy")
+    parser.add_argument("--dry-run", action="store_true", help="Create archives and show sizes, don't upload or delete")
+    parser.add_argument("--output-dir", default="/tmp", help="Directory for temporary tar.gz files (default: /tmp)")
+    parser.add_argument("--only", default=None, help="Only process this archive name (e.g. qwen3-asr-0.6b-int4)")
     args = parser.parse_args()
 
     results = []
@@ -157,7 +144,7 @@ def main():
             continue
 
         filename = f"{name}.tar.gz"
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Archive: {filename}")
 
         tar_path = create_tar(archive, args.output_dir)
@@ -171,11 +158,11 @@ def main():
         if not args.dry_run:
             upload_tar(tar_path, archive["repo"], filename)
             os.remove(tar_path)
-            print(f"  Deleted local tar")
+            print("  Deleted local tar")
         else:
-            print(f"  Dry run — skipping upload")
+            print("  Dry run — skipping upload")
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Summary:")
     for filename, size_mb, repo in results:
         print(f"  {filename}: {size_mb:.1f} MB → {repo}")

@@ -19,19 +19,18 @@ import json
 import os
 import re
 import string
-import sys
 import time
-from typing import Iterator
+from collections.abc import Iterator
 
 import numpy as np
 import onnxruntime as ort
 import soundfile as sf
-from datasets import load_dataset, Audio
-
+from datasets import Audio, load_dataset
 
 # ---------------------------------------------------------------------------
 # Text normalization (shared with evaluate_wer.py)
 # ---------------------------------------------------------------------------
+
 
 def normalize(text: str) -> str:
     """
@@ -216,7 +215,7 @@ def transcribe_parakeet(model: dict, audio: np.ndarray) -> str:
     state1 = np.zeros(model["state_shapes"]["input_states_1"], dtype=np.float32)
     state2 = np.zeros(model["state_shapes"]["input_states_2"], dtype=np.float32)
 
-    tokens = []
+    tokens: list[int] = []
     t = 0
     emitted_tokens = 0
 
@@ -244,10 +243,7 @@ def transcribe_parakeet(model: dict, audio: np.ndarray) -> str:
         logits_1d = logits.flatten()
 
         # TDT: split vocab logits from duration logits
-        if len(logits_1d) > vocab_size:
-            vocab_logits = logits_1d[:vocab_size]
-        else:
-            vocab_logits = logits_1d
+        vocab_logits = logits_1d[:vocab_size] if len(logits_1d) > vocab_size else logits_1d
 
         token = int(np.argmax(vocab_logits))
 
@@ -312,6 +308,7 @@ def stream_samples(dataset_key: str, n: int) -> Iterator[tuple[np.ndarray, str]]
 
         if sr != 16000:
             import librosa
+
             arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
 
         ref = sample[text_field]
@@ -326,8 +323,8 @@ def stream_samples(dataset_key: str, n: int) -> Iterator[tuple[np.ndarray, str]]
 # Evaluation loop
 # ---------------------------------------------------------------------------
 
-def evaluate(model_dirs: list[tuple[str, str]], dataset_keys: list[str],
-             n_samples: int, output_path: str | None):
+
+def evaluate(model_dirs: list[tuple[str, str]], dataset_keys: list[str], n_samples: int, output_path: str | None):
     print("Loading models...")
     models = []
     for name, model_dir in model_dirs:
@@ -341,9 +338,9 @@ def evaluate(model_dirs: list[tuple[str, str]], dataset_keys: list[str],
     for dataset_key in dataset_keys:
         cfg = DATASET_CONFIGS[dataset_key]
         label = cfg["label"]
-        print(f"{'='*72}")
+        print(f"{'=' * 72}")
         print(f"Dataset: {label}  (n={n_samples})")
-        print(f"{'='*72}")
+        print(f"{'=' * 72}")
 
         for name, *_ in models:
             results[name][dataset_key] = []
@@ -360,7 +357,7 @@ def evaluate(model_dirs: list[tuple[str, str]], dataset_keys: list[str],
             elapsed = time.time() - t_start
             print(f"  [{sample_count:4d}/{n_samples}] {elapsed:6.0f}s  ref: {ref_norm[:60]}")
 
-            for name, model_dir, model in models:
+            for name, _model_dir, model in models:
                 try:
                     hyp_raw = transcribe_parakeet(model, audio)
                     hyp_norm = normalize(hyp_raw)
@@ -376,9 +373,9 @@ def evaluate(model_dirs: list[tuple[str, str]], dataset_keys: list[str],
         print()
 
     # Summary
-    print(f"\n{'='*72}")
+    print(f"\n{'=' * 72}")
     print(f"{'SUMMARY':^72}")
-    print(f"{'='*72}")
+    print(f"{'=' * 72}")
     col_w = max(len(n) for n, *_ in models) + 2
     header = f"{'Dataset':<28} {'Model':<{col_w}} {'Samples':>8} {'WER%':>7}"
     print(header)
@@ -408,10 +405,9 @@ def evaluate(model_dirs: list[tuple[str, str]], dataset_keys: list[str],
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate WER of Parakeet-TDT ONNX models on benchmark datasets"
-    )
+    parser = argparse.ArgumentParser(description="Evaluate WER of Parakeet-TDT ONNX models on benchmark datasets")
     parser.add_argument(
         "--models",
         nargs="+",

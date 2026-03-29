@@ -49,13 +49,13 @@ from export import (
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
 from src.mel import log_mel_spectrogram
-from src.prompt import EOS_TOKEN_IDS, build_prompt_ids, get_audio_pad_range
+from src.prompt import build_prompt_ids
 from validate import greedy_decode_pytorch, run_encoder_pytorch
-
 
 # ---------------------------------------------------------------------------
 # Calibration
 # ---------------------------------------------------------------------------
+
 
 def collect_activations(
     model,
@@ -89,6 +89,7 @@ def collect_activations(
 
     hooks = []
     for name, module in norm_modules.items():
+
         def make_hook(n: str):
             def hook(mod, inp, output):
                 # output: [batch, seq_len, hidden_size]
@@ -99,7 +100,9 @@ def collect_activations(
                 else:
                     accum[n] += stats
                     counts[n] += 1
+
             return hook
+
         hooks.append(module.register_forward_hook(make_hook(name)))
 
     print(f"Collecting activations from {n_samples} calibration samples (librispeech train.clean.100)...")
@@ -129,6 +132,7 @@ def collect_activations(
             arr = arr.mean(axis=1)
         if sr != 16000:
             import librosa
+
             arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
 
         if len(arr) < 3200:  # < 0.2s
@@ -144,8 +148,11 @@ def collect_activations(
             prompt_ids = build_prompt_ids(audio_token_count)
             # Hooks accumulate on every decoder forward call inside greedy_decode_pytorch
             greedy_decode_pytorch(
-                model, audio_features, prompt_ids,
-                max_tokens=64, device=device,
+                model,
+                audio_features,
+                prompt_ids,
+                max_tokens=64,
+                device=device,
             )
 
             sample_count += 1
@@ -182,6 +189,7 @@ def collect_activations(
 # Scale computation
 # ---------------------------------------------------------------------------
 
+
 def compute_scales(
     activations: dict[str, torch.Tensor],
     alpha: float = 0.5,
@@ -206,6 +214,7 @@ def compute_scales(
 # ---------------------------------------------------------------------------
 # Smoothing application
 # ---------------------------------------------------------------------------
+
 
 def apply_smoothing(model, scales: dict[str, torch.Tensor]) -> None:
     """
@@ -254,6 +263,7 @@ def apply_smoothing(model, scales: dict[str, torch.Tensor]) -> None:
 # Verification
 # ---------------------------------------------------------------------------
 
+
 def verify_equivalence(
     original_model,
     smoothed_model,
@@ -273,6 +283,7 @@ def verify_equivalence(
         audio = audio.mean(axis=1)
     if sr != 16000:
         import librosa
+
         audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
 
     mel = log_mel_spectrogram(audio, device=device)
@@ -303,11 +314,12 @@ def verify_equivalence(
 # Statistics
 # ---------------------------------------------------------------------------
 
+
 def print_scale_stats(scales: dict[str, torch.Tensor]) -> None:
     """Print per-group smoothing scale statistics."""
     print("\nSmoothing scale statistics:")
     print(f"  {'Norm':<52} {'min':>7} {'max':>7} {'mean':>7} {'max/min':>8}")
-    print(f"  {'-'*84}")
+    print(f"  {'-' * 84}")
 
     # Print in layer order, grouped by suffix
     for suffix in ["input_layernorm", "post_attention_layernorm", "norm"]:
@@ -326,47 +338,66 @@ def print_scale_stats(scales: dict[str, torch.Tensor]) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="AWQ smoothing for Qwen3-ASR ONNX export")
     parser.add_argument(
-        "--model", type=str, default="Qwen/Qwen3-ASR-0.6B",
+        "--model",
+        type=str,
+        default="Qwen/Qwen3-ASR-0.6B",
         help="HuggingFace model ID or local path",
     )
     parser.add_argument(
-        "--output", type=str, default=None,
+        "--output",
+        type=str,
+        default=None,
         help="Output directory for smoothed ONNX (default: derived from model name)",
     )
     parser.add_argument(
-        "--alpha", type=float, default=0.5,
+        "--alpha",
+        type=float,
+        default=0.5,
         help="Smoothing strength α (0=no smoothing, 1=full, default: 0.5)",
     )
     parser.add_argument(
-        "--n-samples", type=int, default=128,
+        "--n-samples",
+        type=int,
+        default=128,
         help="Number of calibration samples from librispeech train.clean.100",
     )
     parser.add_argument(
-        "--verify", action="store_true",
+        "--verify",
+        action="store_true",
         help="Verify smoothed model produces identical tokens to original",
     )
     parser.add_argument(
-        "--verify-audio", type=str, default="tests/fixtures/test_audio.wav",
+        "--verify-audio",
+        type=str,
+        default="tests/fixtures/test_audio.wav",
         help="Audio file for equivalence verification",
     )
     parser.add_argument(
-        "--activations-cache", type=str, default=None,
+        "--activations-cache",
+        type=str,
+        default=None,
         help="Path to .npz file for loading/saving calibration activations. "
-             "If the file exists, calibration is skipped (useful for alpha sweeps).",
+        "If the file exists, calibration is skipped (useful for alpha sweeps).",
     )
     parser.add_argument(
-        "--device", type=str, default="cpu",
+        "--device",
+        type=str,
+        default="cpu",
         help="PyTorch device",
     )
     parser.add_argument(
-        "--opset", type=int, default=17,
+        "--opset",
+        type=int,
+        default=17,
         help="ONNX opset version",
     )
     parser.add_argument(
-        "--skip-encoder", action="store_true",
+        "--skip-encoder",
+        action="store_true",
         help="Skip encoder export",
     )
     args = parser.parse_args()
@@ -409,7 +440,7 @@ def main():
     model_orig = None
     if args.verify:
         if os.path.exists(args.verify_audio):
-            print(f"\nLoading second model copy for equivalence verification...")
+            print("\nLoading second model copy for equivalence verification...")
             model_orig = load_model(args.model, device=args.device, dtype=torch.float32)
         else:
             print(f"Skipping verify: {args.verify_audio} not found")

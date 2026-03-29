@@ -18,25 +18,22 @@ Usage:
 import argparse
 import json
 import os
-import shutil
 
+import onnx
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from src.encoder_wrapper import export_encoder
-import onnx
-
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
-from share_weights import share_external_models
+from src.encoder_wrapper import export_encoder
 from src.prompt import (
-    ENDOFTEXT_TOKEN_ID,
-    IM_START_TOKEN_ID,
-    IM_END_TOKEN_ID,
-    AUDIO_START_TOKEN_ID,
+    ASR_TEXT_TOKEN_ID,
     AUDIO_END_TOKEN_ID,
     AUDIO_PAD_TOKEN_ID,
-    ASR_TEXT_TOKEN_ID,
+    AUDIO_START_TOKEN_ID,
+    ENDOFTEXT_TOKEN_ID,
     EOS_TOKEN_IDS,
+    IM_END_TOKEN_ID,
+    IM_START_TOKEN_ID,
 )
 
 
@@ -64,6 +61,7 @@ def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
         from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
             Qwen3ASRForConditionalGeneration,
         )
+
         model = Qwen3ASRForConditionalGeneration.from_pretrained(
             model_id,
             torch_dtype=dtype,
@@ -73,7 +71,6 @@ def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
     model.eval()
     print(f"Model loaded. Device: {device}, dtype: {dtype}")
     return model
-
 
 
 def copy_tokenizer(model_id: str, output_dir: str):
@@ -125,9 +122,7 @@ def verify_special_tokens(model_id: str):
             print(f"  OK: {token_str} = {actual_id}")
 
     if not all_ok:
-        raise ValueError(
-            "Special token IDs do not match. Update src/prompt.py with correct values."
-        )
+        raise ValueError("Special token IDs do not match. Update src/prompt.py with correct values.")
     print("All special token IDs verified.")
 
 
@@ -230,7 +225,6 @@ def write_config(model, output_dir: str):
     print(f"Config saved to {output_path}")
 
 
-
 def _convert_to_fp16(output_dir: str, filenames: list[str]):
     """Convert FP32 ONNX files to FP16 using ORT's graph optimizer.
 
@@ -253,7 +247,7 @@ def _convert_to_fp16(output_dir: str, filenames: list[str]):
             size_before += os.path.getsize(data_path)
 
         print(f"  Converting {filename} to FP16...")
-        m = optimize_model(path, model_type='gpt2', opt_level=0)
+        m = optimize_model(path, model_type="gpt2", opt_level=0)
         m.convert_float_to_float16(keep_io_types=True)
 
         # Remove old external data before saving
@@ -421,7 +415,6 @@ def main():
     if not args.skip_decoder:
         print("\n=== Saving embedding cache ===")
         embed_weight = model.thinker.model.embed_tokens.weight.data
-        import numpy as np
         embed_np = embed_weight.cpu().float().numpy()
         embed_path = os.path.join(args.output, "embed_tokens.bin")
         embed_np.tofile(embed_path)
