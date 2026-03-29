@@ -49,6 +49,8 @@
 
 **Implication:** The export pipeline should include an optimize_model step between FP32 export and int4 quantization. This is a free 4% speedup with no quality tradeoff. The same approach should work for 1.7B (untested — same architecture, same fusion pattern).
 
+**Integration:** Implemented as the fuse-then-quantize step in `optimize_graphs.py`, applied to both decoders and encoder before int4 quantization.
+
 ### [112] ORT transformer optimizer — SkipLayerNorm + BiasGelu fusion on encoder
 **Date:** 2026-03-30
 **Idea:** Following the decoder RMSNorm fusion finding ([111]), test whether the ORT transformer optimizer also improves the encoder. The encoder uses standard LayerNorm (not RMSNorm) and GELU activations, which should match the SkipLayerNormalization and BiasGelu fusion patterns.
@@ -78,6 +80,8 @@
 - File size increased slightly (717 → 746 MB) due to fused op attributes.
 - Safe to adopt for distribution if the encoder file size increase (~30 MB) is acceptable. Not high priority — the speedup is marginal.
 
+**Integration:** Encoder fusion integrated into `optimize_graphs.py` alongside the decoder fusion from [111]. Applied before int4 quantization in the export pipeline.
+
 ### [111] ORT transformer optimizer — SimplifiedLayerNormalization fusion on decoders
 **Date:** 2026-03-30
 **Idea:** ORT's runtime optimizer does NOT fuse the decomposed RMSNorm pattern (ReduceMean → Pow → Add → Sqrt/Reciprocal → Mul, 113 instances × 5 ops = 565 ops) into `SimplifiedLayerNormalization`. The ORT transformer optimizer (`optimize_model` with `model_type=gpt2`) does fuse these, reducing node count by ~30% (2266 → 1586). Test whether pre-optimizing the decoder graphs improves inference speed. Also test if the GQA attention pattern (16Q/8KV heads, MRoPE) fuses.
@@ -106,6 +110,8 @@
 - The int4 regression is likely due to accumulated floating point differences: `SimplifiedLayerNormalization` uses a single fused kernel with different intermediate rounding than the 5-op chain. On FP32 this is bit-exact, but on int4 (where inputs have quantization noise) the different rounding propagates.
 - For FP32-only distribution, pre-optimization is safe. For int4, it requires a full 200-sample WER validation before adoption.
 - A future ORT version may add this fusion to the runtime optimizer, making pre-optimization unnecessary.
+
+**Integration:** FP32 decoder fusion integrated into `optimize_graphs.py` (runs before int4 quantization per [113]). The int4 regression is avoided by the fuse-then-quantize pipeline order.
 
 ### [110] Native FP16 encoder inference regression — Windows benchmark
 **Date:** 2026-03-29
