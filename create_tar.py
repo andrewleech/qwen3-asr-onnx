@@ -42,9 +42,8 @@ ARCHIVES = [
         "files": [
             "encoder.int4.onnx",
             "decoder_init.int4.onnx",
-            "decoder_init.int4.onnx.data",
             "decoder_step.int4.onnx",
-            "decoder_step.int4.onnx.data",
+            "decoder_weights.int4.data",
         ],
     },
     {
@@ -65,9 +64,8 @@ ARCHIVES = [
         "files": [
             "encoder.int4.onnx",
             "decoder_init.int4.onnx",
-            "decoder_init.int4.onnx.data",
             "decoder_step.int4.onnx",
-            "decoder_step.int4.onnx.data",
+            "decoder_weights.int4.data",
         ],
     },
 ]

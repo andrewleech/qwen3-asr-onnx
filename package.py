@@ -152,7 +152,7 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     fp32_total = copy_file_set(input_dir, output_dir, FP32_FILES, "FP32 files", hardlink=False)
     int4_total = 0
     if has_int4:
-        int4_total = copy_file_set(input_dir, output_dir, INT4_FILES, "int4 files", hardlink=hardlink)
+        int4_total = copy_file_set(input_dir, output_dir, INT4_FILES, "int4 files", hardlink=False)
     else:
         print("\n  No int4 files found, skipping")
     shared_total = copy_file_set(input_dir, output_dir, SHARED_FILES, "Shared metadata", hardlink=hardlink)
@@ -167,6 +167,16 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         saved = os.path.getsize(step_data)
         share_external_models(output_dir)
         fp32_total -= saved
+        print(f"    Eliminated {format_size(saved)} duplicate")
+
+    # Share int4 decoder weights — same deduplication as FP32.
+    init_int4_data = os.path.join(output_dir, "decoder_init.int4.onnx.data")
+    step_int4_data = os.path.join(output_dir, "decoder_step.int4.onnx.data")
+    if os.path.exists(init_int4_data) and os.path.exists(step_int4_data):
+        print(f"\nSharing int4 decoder weights:")
+        saved = os.path.getsize(step_int4_data)
+        share_external_models(output_dir, suffix="int4")
+        int4_total -= saved
         print(f"    Eliminated {format_size(saved)} duplicate")
 
     # Embed tokens — ship as FP16 to halve file size (zero WER impact per experiment [104]).
@@ -240,8 +250,9 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     # FP32 variant: encoder.onnx + decoder*.onnx + decoder_weights.data (shared)
     fp32_variant_files = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx",
                           "decoder_weights.data"]
-    # int4 variant: encoder.int4.onnx + decoder*.int4.onnx + *.int4.onnx.data
-    int4_variant_files = [f for f in INT4_FILES]
+    # int4 variant: encoder.int4.onnx + decoder*.int4.onnx + decoder_weights.int4.data (shared)
+    int4_variant_files = ["encoder.int4.onnx", "decoder_init.int4.onnx", "decoder_step.int4.onnx",
+                          "decoder_weights.int4.data"]
 
     for variant, file_list in [("", fp32_variant_files), ("-int4", int4_variant_files)]:
         if variant == "-int4" and not has_int4:
