@@ -1,4 +1,25 @@
 
+### [110] Native FP16 encoder inference regression — Windows benchmark
+**Date:** 2026-03-29
+**Idea:** The native FP16 encoder from [108] halves file size with zero WER impact. Measure whether the 2 Cast nodes at the I/O boundary (FP32→FP16 input, FP16→FP32 output) affect per-inference speed on native Windows.
+
+**Result (Ryzen AI 7 PRO 350, native Windows, ORT 2.0 rc12, 11s JFK audio):**
+| Encoder | Load | Mean (10 runs) | Min | Max | RTF |
+|---|---|---|---|---|---|
+| FP32 (717 MB) | 5.04s | **1.850s** | 1.807s | 1.881s | **0.17x** |
+| Native FP16 (358 MB) | 4.75s | **2.012s** | 1.957s | 2.036s | **0.18x** |
+
+**Outcome:** CONFIRMED REGRESSION — FP16 encoder is 8.7% slower per inference (0.162s, repeatable with no distribution overlap). Loads 5% faster (smaller file). The Cast nodes at the I/O boundary prevent ORT from fusing ops across the FP16/FP32 boundary.
+
+**Decision:**
+- **0.6B:** Revert to FP32 encoder. 359 MB size increase is acceptable in a ~2 GB package. Speed matters more for Handy's PTT use case.
+- **1.7B:** Keep native FP16 encoder. The 1.7B package is larger (3.3 GB) so the 609 MB savings is more impactful, and the 1.7B already got faster from the GPTQ→RTN switch (0.37x→0.32x).
+
+**Notes:**
+- The regression is from per-inference Cast overhead, not load-time. ORT's graph optimizer cannot fuse operators across dtype boundaries.
+- FP32 encoder compresses well in tar.gz (~350 MB compressed), so the download size impact is minimal.
+- A future ORT version with better mixed-precision fusion could eliminate this overhead.
+
 ### [109] Int4 decoder weight sharing — share_weights.py on quantized models
 **Date:** 2026-03-29
 **Idea:** The split decoder (init + step) duplicates transformer layer weights in separate `.data` files. For FP32, `share_weights.py` deduplicates by hash-matching. Test whether the same works for int4 quantized weights — RTN is deterministic, so identically-quantized weights from the same FP32 source should be byte-identical.

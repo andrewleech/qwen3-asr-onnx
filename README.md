@@ -14,7 +14,7 @@ Each model directory contains FP32 files plus quantized variants with suffixed n
 | File pattern | Description |
 |---|---|
 | `encoder.onnx` | FP32 audio encoder (weights inlined) |
-| `encoder.int4.onnx` | Encoder for int4 variant (native FP16 via autocast export, FP32 I/O — half the size of FP32, zero WER impact) |
+| `encoder.int4.onnx` | Encoder for int4 variant (FP32 for 0.6B, native FP16 for 1.7B — see experiment [110]) |
 | `decoder_init.onnx` | FP32 decoder prefill (full sequence, outputs KV cache) |
 | `decoder_step.onnx` | FP32 decoder autoregressive step (single token + KV cache) |
 | `decoder_weights.data` | Shared external weights for both FP32 decoders |
@@ -37,7 +37,7 @@ Multiple quantization variants coexist in a single directory. The consumer selec
 
 | Model | Variant | WER | RTF (CPU) | tar.gz download |
 |---|---|---|---|---|
-| **0.6B** | int4 RTN al4 | 5.16% | 0.18x | 1.2 GB |
+| **0.6B** | int4 RTN al4 | 5.16% | 0.17x | 1.3 GB |
 | **1.7B** | int4 RTN al4 | 4.20% | 0.32x | 2.5 GB |
 | Parakeet-TDT 0.6B INT8 | reference | 5.45% | 0.16x | — |
 
@@ -49,14 +49,14 @@ Each int4 package contains the files needed for quantized inference:
 
 | Component | 0.6B | 1.7B | Format | Why this format |
 |---|---|---|---|---|
-| `encoder.int4.onnx` | 358 MB | 609 MB | **native FP16** | Autocast export — FP16 ops internally, FP32 I/O. Zero WER impact vs FP32 encoder |
+| `encoder.int4.onnx` | 717 MB (FP32) | 609 MB (FP16) | **see notes** | 0.6B uses FP32 (FP16 adds 8.7% inference overhead). 1.7B uses native FP16 (size savings outweighs small overhead) |
 | `decoder_init.int4.onnx` | 2 MB | 2 MB | **int4** | Graph proto only — weights in shared data file |
 | `decoder_step.int4.onnx` | 87 MB | 171 MB | **int4** | Graph proto + inlined lm_head weights (unmatched between init/step) |
 | `decoder_weights.int4.data` | 833 MB | 1,953 MB | **int4** | Shared external weights for both decoders (RTN al4 bs64) |
 | `embed_tokens.bin` | 296 MB | 593 MB | **FP16** | Zero measured WER impact vs FP32. Consumer casts to FP32 at lookup time |
 | `config.json` + `tokenizer.json` | ~11 MB | ~11 MB | — | Architecture config, special tokens, mel params, tokenizer |
 
-Uncompressed total: 0.6B = 1.6 GB, 1.7B = 3.3 GB.
+Uncompressed total: 0.6B = 2.0 GB, 1.7B = 3.3 GB.
 
 The encoder uses a native FP16 export via `torch.amp.autocast` tracing. Unlike post-hoc FP16 conversion (which inserts Cast nodes and breaks quality), autocast tracing captures native FP16 ops while keeping precision-sensitive operations (LayerNorm, softmax) in FP32. The attention mask uses `torch.finfo(float16).min` = -65504 (valid FP16), avoiding the overflow that breaks post-hoc conversion. Result: half the FP32 encoder size with zero measured WER impact (verified on both 0.6B and 1.7B, 200-sample LibriSpeech test-other).
 
@@ -82,7 +82,7 @@ The two decoder protos (~2 MB each) reference offsets in the single shared `deco
 | 1.7B FP32 | 3.79% | ~0.70x | ~0.70x |
 | 1.7B int4 RTN al4 | 4.20% | 0.32x | — |
 | 0.6B FP32 | 4.42% | 0.29x | 0.32x |
-| **0.6B int4 RTN al4** | **5.16%** | **0.18x** | — |
+| **0.6B int4 RTN al4** | **5.16%** | **0.17x** | — |
 | 0.6B AWQ INT8 α=0.2 | 5.21% | 0.14x | 0.17x |
 | Parakeet-TDT 0.6B INT8 | 5.45% | 0.16x | 0.13x |
 
@@ -92,7 +92,7 @@ RTF measured on Ryzen AI 7 PRO 350 (native Windows, ORT 2.0 rc12). WER from 200-
 
 | Host | CPU | DirectML | WebGPU |
 |---|---|---|---|
-| anl (Ryzen AI 7 PRO 350, Radeon 860M iGPU) | **2.03s** (0.18x) | 19.9s (garbage output) | 5.16s (0.47x) |
+| anl (Ryzen AI 7 PRO 350, Radeon 860M iGPU) | **1.85s** (0.17x) | 19.9s (garbage output) | 5.16s (0.47x) |
 | step (Ryzen 9 3900X, GTX 1650 SUPER 4 GB) | 2.42s (0.22x) | 2.25s (0.20x) | **1.83s** (0.17x) |
 
 - **NVIDIA (GTX 1650 SUPER):** WebGPU gives 24% speedup over CPU (1.83s vs 2.42s). DirectML works correctly with 7% speedup. All outputs correct.
@@ -143,13 +143,13 @@ python quantize_nbits.py \
     --output output/qwen3-asr-0.6b \
     --bits 4 --block-size 64 --accuracy-level 4
 
-# Native FP16 encoder (autocast export — half size, zero WER impact):
-python export_encoder_native_fp16.py \
-    --model Qwen/Qwen3-ASR-0.6B \
-    --output output/qwen3-asr-0.6b/encoder.int4.onnx
+# Copy FP32 encoder as the int4 encoder (FP16 adds 8.7% inference overhead on 0.6B, see [110]):
+cp output/qwen3-asr-0.6b/encoder.onnx output/qwen3-asr-0.6b/encoder.int4.onnx
 ```
 
 `--accuracy-level 4` activates a higher-precision accumulation kernel in ORT that is both faster and more accurate than the default on x86.
+
+For 1.7B, use native FP16 encoder instead (size savings outweighs the small overhead at that scale).
 
 GPTQ calibration is also supported but provides no WER benefit over RTN (see section 4).
 
@@ -224,10 +224,8 @@ uv run python quantize_nbits.py \
     --output output/qwen3-asr-0.6b \
     --bits 4 --block-size 64 --accuracy-level 4
 
-# Native FP16 encoder (autocast export — half size, zero WER impact)
-uv run python export_encoder_native_fp16.py \
-    --model Qwen/Qwen3-ASR-0.6B \
-    --output output/qwen3-asr-0.6b/encoder.int4.onnx
+# Copy FP32 encoder as the int4 encoder (FP16 adds inference overhead on 0.6B)
+cp output/qwen3-asr-0.6b/encoder.onnx output/qwen3-asr-0.6b/encoder.int4.onnx
 
 # Convert embed_tokens to FP16 (halves file size, zero WER impact)
 uv run python convert_embed_fp16.py --model-dir output/qwen3-asr-0.6b
@@ -298,7 +296,7 @@ After full reproduction:
 output/
 ├── qwen3-asr-0.6b/              # All 0.6B variants in one directory
 │   ├── encoder.onnx              # FP32
-│   ├── encoder.int4.onnx         # Native FP16 (autocast export, FP32 I/O)
+│   ├── encoder.int4.onnx         # FP32 (copy of encoder.onnx — FP16 adds overhead, see [110])
 │   ├── decoder_init.onnx         # FP32
 │   ├── decoder_init.onnx.data
 │   ├── decoder_init.int4.onnx    # int4 RTN al4
@@ -312,7 +310,7 @@ output/
 │   └── tokenizer.json
 ├── qwen3-asr-1.7b/              # All 1.7B variants in one directory
 │   ├── encoder.onnx              # FP32
-│   ├── encoder.int4.onnx         # Native FP16 (autocast export, FP32 I/O)
+│   ├── encoder.int4.onnx         # Native FP16 (autocast export, FP32 I/O — size savings worth it at 1.7B)
 │   ├── decoder_init.onnx         # FP32
 │   ├── decoder_init.onnx.data
 │   ├── decoder_init.int4.onnx    # int4 RTN al4
