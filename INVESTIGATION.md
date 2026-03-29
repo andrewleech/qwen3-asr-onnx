@@ -1,4 +1,47 @@
 
+### [109] Int4 decoder weight sharing — share_weights.py on quantized models
+**Date:** 2026-03-29
+**Idea:** The split decoder (init + step) duplicates transformer layer weights in separate `.data` files. For FP32, `share_weights.py` deduplicates by hash-matching. Test whether the same works for int4 quantized weights — RTN is deterministic, so identically-quantized weights from the same FP32 source should be byte-identical.
+
+**Change:** Extended `share_weights.py` with `--suffix int4` to handle suffixed filenames (`decoder_init.int4.onnx`). Produces `decoder_weights.int4.data` as the shared file.
+
+**Result (0.6B, both decoders RTN al4 bs64):**
+| Metric | Value |
+|---|---|
+| Matched tensors | 645 / 648 |
+| Shared data | 0.25 GB (transformer layers) |
+| Unmatched (inlined) | 3 tensors — lm_head int4 (89 MB), inlined into step proto |
+| Step proto size | 91 MB (was 2 MB + 325 MB .data) |
+| Net savings | 234 MB (1,159 → 925 MB) |
+| WER | 5.16% (identical to baseline) |
+| RTF | 0.24x (identical) |
+
+**Result (1.7B, GPTQ init + RTN step):**
+| Metric | Value |
+|---|---|
+| Matched tensors | 57 / 648 (small constants only) |
+| Net savings | ~0 MB (591 tensors inlined, step proto = 983 MB) |
+
+**Outcome:** SUCCESS for 0.6B — transformer layer int4 weights are byte-identical when both use RTN. FAILURE for 1.7B — GPTQ and RTN produce different int4 representations. Mixed quantization methods prevent weight sharing.
+
+**Why lm_head doesn't match:** In decoder_init, `lm_head.weight` is FP32 (used as Gather for embedding lookup — quantizer only converts MatMul ops). In decoder_step, lm_head is int4-quantized (MatMulNBits). Different representations → no hash match.
+
+**Trial 1 — RTN-only for 1.7B (200-sample LibriSpeech test-other):**
+| Model | WER | RTF | Sharing |
+|---|---|---|---|
+| Baseline GPTQ+RTN | 4.16% | 0.50x | 57/648 tensors matched (0 MB saved) |
+| RTN-only (shared) | 4.20% | 0.50x | 645/648 tensors matched (0.98 GB saved) |
+
+RTN-only WER is +0.04pp (within noise). Prior experiment [89] measured +0.08pp — confirmed: RTN-only is equivalent to GPTQ+RTN for 1.7B. GPTQ is no longer recommended; RTN-only enables weight sharing.
+
+**Summary — recommended int4 format:**
+| Model | Quantization | Sharing | Savings | WER |
+|---|---|---|---|---|
+| 0.6B | RTN al4 bs64 | share_weights.py --suffix int4 | 234 MB (1,159 → 925 MB) | 5.16% (unchanged) |
+| 1.7B | RTN al4 bs64 (both) | share_weights.py --suffix int4 | 937 MB (2,937 → 2,000 MB) | 4.20% (was 4.16% GPTQ) |
+
+Trial 2 (hidden_states export) deferred — Trials 0+1 deliver the majority of savings without Rust code changes.
+
 ### [108] Native FP16 encoder export — autocast tracing (0.6B)
 **Date:** 2026-03-29
 **Idea:** The weight-only FP16 approach ([107]) failed because the attention mask constant (`-3.4e38`) overflows FP16 range. The graph-level FP16 conversion (`convert_fp16.py`) inserts Cast nodes everywhere, degrading both speed and quality. Try a third approach: load the model in FP32, export with `torch.amp.autocast('cpu', dtype=torch.float16)` so PyTorch traces native FP16 ops where safe and keeps FP32 for precision-sensitive ops (LayerNorm, softmax). The attention mask uses `torch.finfo(torch.float16).min` = `-65504` (valid FP16) instead of `-3.4e38`.

@@ -32,6 +32,20 @@ import onnx
 SHARED_DATA_NAME = "decoder_weights.data"
 
 
+def _shared_data_name(suffix=None):
+    """Shared data filename, optionally with quantization suffix."""
+    if suffix:
+        return f"decoder_weights.{suffix}.data"
+    return SHARED_DATA_NAME
+
+
+def _decoder_filenames(suffix=None):
+    """Return (init_onnx, step_onnx) filenames with optional suffix."""
+    if suffix:
+        return f"decoder_init.{suffix}.onnx", f"decoder_step.{suffix}.onnx"
+    return "decoder_init.onnx", "decoder_step.onnx"
+
+
 def get_external_info(tensor):
     """Extract external data location from a tensor proto."""
     info = {}
@@ -80,13 +94,15 @@ def build_init_index(init_model, data_mm):
     return index
 
 
-def share_external_models(model_dir):
+def share_external_models(model_dir, suffix=None):
     """Share weights when both models have external .data files."""
-    init_proto_path = os.path.join(model_dir, "decoder_init.onnx")
-    step_proto_path = os.path.join(model_dir, "decoder_step.onnx")
+    init_name, step_name = _decoder_filenames(suffix)
+    shared_name = _shared_data_name(suffix)
+    init_proto_path = os.path.join(model_dir, init_name)
+    step_proto_path = os.path.join(model_dir, step_name)
     init_data_path = init_proto_path + ".data"
     step_data_path = step_proto_path + ".data"
-    shared_data_path = os.path.join(model_dir, SHARED_DATA_NAME)
+    shared_data_path = os.path.join(model_dir, shared_name)
 
     # Check preconditions
     if not os.path.exists(init_proto_path) or not os.path.exists(step_proto_path):
@@ -99,7 +115,7 @@ def share_external_models(model_dir):
 
     if not os.path.exists(init_data_path) or not os.path.exists(step_data_path):
         print(f"  External data files missing — trying inline path")
-        return share_inline_models(model_dir)
+        return share_inline_models(model_dir, suffix=suffix)
 
     step_data_size = os.path.getsize(step_data_path)
     init_data_size = os.path.getsize(init_data_path)
@@ -136,8 +152,8 @@ def share_external_models(model_dir):
             h = hash_data(step_mm, offset, length)
 
             if h in init_index:
-                init_name, init_offset, init_length = init_index[h]
-                set_tensor_external(tensor, SHARED_DATA_NAME, init_offset, init_length)
+                init_tname, init_offset, init_length = init_index[h]
+                set_tensor_external(tensor, shared_name, init_offset, init_length)
                 matched += 1
                 matched_bytes += length
             else:
@@ -154,10 +170,10 @@ def share_external_models(model_dir):
             continue
         for entry in tensor.external_data:
             if entry.key == "location":
-                entry.value = SHARED_DATA_NAME
+                entry.value = shared_name
 
     # Rename init data file -> shared
-    print(f"  Renaming {os.path.basename(init_data_path)} -> {SHARED_DATA_NAME}")
+    print(f"  Renaming {os.path.basename(init_data_path)} -> {shared_name}")
     os.rename(init_data_path, shared_data_path)
 
     # Save both protos
@@ -178,18 +194,20 @@ def share_external_models(model_dir):
     print(f"\n  Results:")
     print(f"    Matched:  {matched} tensors ({matched_bytes / 1e9:.2f} GB)")
     print(f"    Inlined:  {inlined} tensors (small constants)")
-    print(f"    Shared data:  {shared_size / 1e9:.2f} GB ({SHARED_DATA_NAME})")
+    print(f"    Shared data:  {shared_size / 1e9:.2f} GB ({shared_name})")
     print(f"    Init proto:   {init_proto_size / 1e6:.1f} MB")
     print(f"    Step proto:   {step_proto_size / 1e6:.1f} MB")
     print(f"    Saved:        {step_data_size / 1e9:.2f} GB")
     return True
 
 
-def share_inline_models(model_dir):
+def share_inline_models(model_dir, suffix=None):
     """Share weights when models have inline data (no .data files)."""
-    init_proto_path = os.path.join(model_dir, "decoder_init.onnx")
-    step_proto_path = os.path.join(model_dir, "decoder_step.onnx")
-    shared_data_path = os.path.join(model_dir, SHARED_DATA_NAME)
+    init_name, step_name = _decoder_filenames(suffix)
+    shared_name = _shared_data_name(suffix)
+    init_proto_path = os.path.join(model_dir, init_name)
+    step_proto_path = os.path.join(model_dir, step_name)
+    shared_data_path = os.path.join(model_dir, shared_name)
 
     print(f"  Loading init model with inline data...")
     init_model = onnx.load(init_proto_path)
@@ -199,7 +217,7 @@ def share_inline_models(model_dir):
     onnx.external_data_helper.convert_model_to_external_data(
         init_model,
         all_tensors_to_one_file=True,
-        location=SHARED_DATA_NAME,
+        location=shared_name,
         size_threshold=1024,
         convert_attribute=False,
     )
@@ -234,7 +252,7 @@ def share_inline_models(model_dir):
                 init_name, init_offset, init_length = init_index[h]
                 matched_bytes += len(tensor.raw_data)
                 tensor.raw_data = b""
-                set_tensor_external(tensor, SHARED_DATA_NAME, init_offset, init_length)
+                set_tensor_external(tensor, shared_name, init_offset, init_length)
                 matched += 1
             else:
                 inlined_kept += 1
@@ -259,7 +277,7 @@ def share_inline_models(model_dir):
     print(f"\n  Results:")
     print(f"    Matched:  {matched} tensors ({matched_bytes / 1e9:.2f} GB)")
     print(f"    Kept inline:  {inlined_kept} tensors")
-    print(f"    Shared data:  {shared_size / 1e9:.2f} GB ({SHARED_DATA_NAME})")
+    print(f"    Shared data:  {shared_size / 1e9:.2f} GB ({shared_name})")
     print(f"    Init proto:   {init_proto_size / 1e6:.1f} MB")
     print(f"    Step proto:   {step_proto_size / 1e6:.1f} MB")
     return True
@@ -280,7 +298,7 @@ def verify_model(model_dir, filename):
     return True
 
 
-def verify_inference(model_dir):
+def verify_inference(model_dir, suffix=None):
     """Load both models in ORT and run a dummy forward pass."""
     try:
         import onnxruntime as ort
@@ -290,16 +308,17 @@ def verify_inference(model_dir):
 
     import numpy as np
 
-    init_path = os.path.join(model_dir, "decoder_init.onnx")
-    step_path = os.path.join(model_dir, "decoder_step.onnx")
+    init_name, step_name = _decoder_filenames(suffix)
+    init_path = os.path.join(model_dir, init_name)
+    step_path = os.path.join(model_dir, step_name)
 
     opts = ort.SessionOptions()
     opts.log_severity_level = 3  # suppress warnings
 
     try:
-        print(f"  Loading decoder_init.onnx in ORT...")
+        print(f"  Loading {init_name} in ORT...")
         init_sess = ort.InferenceSession(init_path, opts)
-        print(f"  Loading decoder_step.onnx in ORT...")
+        print(f"  Loading {step_name} in ORT...")
         step_sess = ort.InferenceSession(step_path, opts)
         print(f"  Both sessions loaded successfully")
         return True
@@ -315,6 +334,11 @@ def main():
     parser.add_argument(
         "model_dir",
         help="Directory containing decoder_init.onnx and decoder_step.onnx",
+    )
+    parser.add_argument(
+        "--suffix",
+        default=None,
+        help="Quantization suffix (e.g. 'int4' for decoder_init.int4.onnx)",
     )
     parser.add_argument(
         "--also-int8",
@@ -336,18 +360,20 @@ def main():
         else:
             print(f"INT8 directory not found: {int8_dir}")
 
+    init_name, step_name = _decoder_filenames(args.suffix)
+
     for model_dir in dirs:
         print(f"\n{'=' * 60}")
-        print(f"Processing: {model_dir}")
+        print(f"Processing: {model_dir} (suffix={args.suffix or 'none'})")
         print(f"{'=' * 60}")
 
-        ok = share_external_models(model_dir)
+        ok = share_external_models(model_dir, suffix=args.suffix)
 
         if ok and args.verify:
             print(f"\n  Verification:")
-            verify_model(model_dir, "decoder_init.onnx")
-            verify_model(model_dir, "decoder_step.onnx")
-            verify_inference(model_dir)
+            verify_model(model_dir, init_name)
+            verify_model(model_dir, step_name)
+            verify_inference(model_dir, suffix=args.suffix)
 
     print(f"\nDone.")
 
