@@ -27,25 +27,25 @@ import subprocess
 
 import numpy as np
 
-# FP32 model files (encoder weights inlined, decoder weights external)
+# FP32 model files (encoder weights inlined, decoder weights in shared file)
 FP32_FILES = [
     "encoder.onnx",
     "decoder_init.onnx",
-    "decoder_init.onnx.data",
     "decoder_step.onnx",
-    "decoder_step.onnx.data",
+    "decoder_weights.data",          # shared external weights (from share_weights.py)
+    "decoder_init.onnx.data",        # fallback: per-decoder data (pre-sharing format)
+    "decoder_step.onnx.data",        # fallback: per-decoder data (pre-sharing format)
 ]
 
-# int4 model files (already suffixed by quantize_nbits.py)
+# int4 model files
 # encoder.int4.onnx is a copy of encoder.onnx (FP32) — INT4/INT8 encoders degrade WER.
-# Optional .data file included for quantized encoders that use external weights.
 INT4_FILES = [
     "encoder.int4.onnx",
-    "encoder.int4.onnx.data",  # optional — only present if encoder is truly quantized
     "decoder_init.int4.onnx",
-    "decoder_init.int4.onnx.data",
     "decoder_step.int4.onnx",
-    "decoder_step.int4.onnx.data",
+    "decoder_weights.int4.data",     # shared external weights (from share_weights.py --suffix int4)
+    "decoder_init.int4.onnx.data",   # fallback: per-decoder data (pre-sharing format)
+    "decoder_step.int4.onnx.data",   # fallback: per-decoder data (pre-sharing format)
 ]
 
 # Shared across all variants
