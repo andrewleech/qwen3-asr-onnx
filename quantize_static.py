@@ -40,6 +40,7 @@ from onnxruntime.quantization import (
 )
 
 from share_weights import share_external_models
+from src.tokenizer_assets import TOKENIZER_FILES, tokenizer_asset_names, validate_tokenizer_assets
 
 # ---------------------------------------------------------------------------
 # Calibration data collection
@@ -72,16 +73,11 @@ def collect_calibration_data(
     decoder_init = ort.InferenceSession(os.path.join(model_dir, "decoder_init.onnx"), opts, providers=providers)
     decoder_step = ort.InferenceSession(os.path.join(model_dir, "decoder_step.onnx"), opts, providers=providers)
 
-    # Load embeddings
-    config_path = os.path.join(model_dir, "config.json")
-    with open(config_path) as f:
-        cfg = json.load(f)
-    dtype_str = cfg.get("embed_tokens_dtype", "float32")
-    shape = cfg["embed_tokens_shape"]
-    dtype = np.float16 if dtype_str == "float16" else np.float32
-    embed_tokens = (
-        np.fromfile(os.path.join(model_dir, "embed_tokens.bin"), dtype=dtype).reshape(shape).astype(np.float32)
-    )
+    from src.embeddings import load_embed_tokens
+    from src.prompt import load_prompt_tokenizer
+
+    embed_tokens = load_embed_tokens(model_dir)
+    tokenizer = load_prompt_tokenizer(model_dir)
 
     # Stream calibration audio
     ds = load_dataset(
@@ -125,7 +121,7 @@ def collect_calibration_data(
             if audio_token_count == 0:
                 continue
 
-            prompt_ids = build_prompt_ids(audio_token_count)
+            prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
             input_embeds = embed_tokens[prompt_ids].copy()
             audio_start, audio_end = get_audio_pad_range(prompt_ids)
             input_embeds[audio_start:audio_end] = audio_features[0]
@@ -325,9 +321,13 @@ def main():
         "--cache-dir",
         type=str,
         default=None,
-        help="Directory to cache/load calibration data (.npz)",
+        help="Directory for freshly collected calibration data; existing unverifiable caches are rejected.",
     )
     args = parser.parse_args()
+    if tokenizer_asset_names(args.input):
+        validate_tokenizer_assets(args.input)
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -354,29 +354,18 @@ def main():
         os.makedirs(args.cache_dir, exist_ok=True)
         cache_path = os.path.join(args.cache_dir, f"calib_n{args.n_samples}_s{args.n_steps}.npz")
 
-    if cache_path and os.path.exists(cache_path):
-        print(f"Loading cached calibration data from {cache_path}...")
-        data = np.load(cache_path, allow_pickle=True)
-        init_inputs = list(data["init_inputs"])
-        step_inputs = list(data["step_inputs"])
-        print(f"  Loaded {len(init_inputs)} init, {len(step_inputs)} step inputs")
-    else:
-        t0 = time.time()
-        init_inputs, step_inputs = collect_calibration_data(
-            args.input,
-            n_samples=args.n_samples,
-            n_steps=args.n_steps,
+    if cache_path and os.path.lexists(cache_path):
+        raise ValueError(
+            f"Unverifiable calibration cache {cache_path}; preserve it and choose a clean cache path for fresh collection"
         )
-        elapsed = time.time() - t0
-        print(f"  Calibration data collected in {elapsed:.1f}s")
-
-        if cache_path:
-            np.savez(
-                cache_path,
-                init_inputs=np.array(init_inputs, dtype=object),
-                step_inputs=np.array(step_inputs, dtype=object),
-            )
-            print(f"  Cached to {cache_path}")
+    t0 = time.time()
+    init_inputs, step_inputs = collect_calibration_data(args.input, n_samples=args.n_samples, n_steps=args.n_steps)
+    print(f"  Calibration data collected in {time.time() - t0:.1f}s")
+    if cache_path:
+        np.savez(
+            cache_path, init_inputs=np.array(init_inputs, dtype=object), step_inputs=np.array(step_inputs, dtype=object)
+        )
+        print(f"  Cached to {cache_path}")
 
     # Quantize decoder_init
     init_path = os.path.join(args.input, "decoder_init.onnx")
@@ -418,10 +407,7 @@ def main():
         "encoder.onnx",
         "embed_tokens.bin",
         "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "added_tokens.json",
-        "vocab.json",
+        *sorted(TOKENIZER_FILES),
     ]:
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
@@ -429,6 +415,9 @@ def main():
             if not os.path.exists(dst):
                 shutil.copy2(src, dst)
                 print(f"  Copied {filename}")
+
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     # Update config
     config_path = os.path.join(args.output, "config.json")

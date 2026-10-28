@@ -143,19 +143,9 @@ def load_sessions(model_dir: str, quant: str | None = None) -> dict:
 
 def load_embed(model_dir: str) -> np.ndarray:
     """Load embed_tokens.bin, converting FP16 → FP32 if needed."""
-    config_path = os.path.join(model_dir, "config.json")
-    with open(config_path) as f:
-        cfg = json.load(f)
-    # v2+ format: embed_tokens_shape removed, derive from decoder config
-    if "embed_tokens_shape" in cfg:
-        shape = cfg["embed_tokens_shape"]
-    else:
-        shape = [cfg["decoder"]["vocab_size"], cfg["decoder"]["hidden_size"]]
-    # embed_tokens_dtype applies regardless of whether embed_tokens_shape is present
-    dtype_str = cfg.get("embed_tokens_dtype", "float32")
-    dtype = np.float16 if dtype_str == "float16" else np.float32
-    embed = np.fromfile(os.path.join(model_dir, "embed_tokens.bin"), dtype=dtype).reshape(shape)
-    return embed.astype(np.float32)
+    from src.embeddings import load_embed_tokens
+
+    return load_embed_tokens(model_dir)
 
 
 # Tokenizer cache — load once per model dir
@@ -164,9 +154,9 @@ _tokenizer_cache: dict = {}
 
 def get_tokenizer(model_dir: str):
     if model_dir not in _tokenizer_cache:
-        from transformers import AutoTokenizer
+        from src.prompt import load_prompt_tokenizer
 
-        _tokenizer_cache[model_dir] = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        _tokenizer_cache[model_dir] = load_prompt_tokenizer(model_dir)
     return _tokenizer_cache[model_dir]
 
 
@@ -366,7 +356,7 @@ def _run(sessions: dict, embed_tokens: np.ndarray, tokenizer, audio: np.ndarray)
     if audio_token_count == 0:
         return ""
 
-    prompt_ids = build_prompt_ids(audio_token_count)
+    prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
     tokens = greedy_decode_onnx(sessions, embed_tokens, audio_features, prompt_ids, max_tokens=256)
 
     while tokens and tokens[-1] in EOS_TOKEN_IDS:

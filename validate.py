@@ -10,7 +10,6 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import time
 
@@ -18,15 +17,18 @@ import numpy as np
 import onnxruntime as ort
 import soundfile as sf
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel
 
+from src.embeddings import load_embed_tokens
 from src.inference import greedy_decode_onnx
 from src.mel import log_mel_spectrogram
 from src.prompt import (
     EOS_TOKEN_IDS,
     build_prompt_ids,
     get_audio_pad_range,
+    load_prompt_tokenizer,
 )
+from src.tokenizer_assets import validate_tokenizer_assets
 
 
 def load_pytorch_model(model_id: str, device: str = "cpu"):
@@ -37,6 +39,7 @@ def load_pytorch_model(model_id: str, device: str = "cpu"):
             torch_dtype=torch.float32,
             device_map=device,
             trust_remote_code=True,
+            attn_implementation="eager",
         )
     except ValueError as e:
         print(f"AutoModel.from_pretrained failed ({e}), falling back to direct import")
@@ -48,42 +51,42 @@ def load_pytorch_model(model_id: str, device: str = "cpu"):
             model_id,
             torch_dtype=torch.float32,
             device_map=device,
+            attn_implementation="eager",
         )
     model.eval()
     return model
 
 
+class FiniteOutputSession:
+    def __init__(self, session, name):
+        self.session = session
+        self.name = name
+
+    def get_inputs(self):
+        return self.session.get_inputs()
+
+    def run(self, output_names, input_feed):
+        outputs = self.session.run(output_names, input_feed)
+        for index, output in enumerate(outputs):
+            if not np.isfinite(output).all():
+                raise ValueError(f"{self.name}: non-finite ONNX output {index}")
+        return outputs
+
+
 def load_onnx_sessions(onnx_dir: str):
-    """Load all ONNX runtime sessions."""
-    sessions = {}
+    names = ("encoder", "decoder_init", "decoder_step")
+    missing = [f"{name}.onnx" for name in names if not os.path.isfile(os.path.join(onnx_dir, f"{name}.onnx"))]
+    if missing:
+        raise FileNotFoundError(f"Missing required ONNX sessions: {', '.join(missing)}")
     providers = ["CPUExecutionProvider"]
-
-    # Check for CUDA
     if "CUDAExecutionProvider" in ort.get_available_providers():
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-
-    for name in ["encoder", "decoder_init", "decoder_step"]:
-        path = os.path.join(onnx_dir, f"{name}.onnx")
-        if os.path.exists(path):
-            sessions[name] = ort.InferenceSession(path, providers=providers)
-            print(f"  Loaded {name}.onnx")
-        else:
-            print(f"  WARNING: {path} not found")
-
-    return sessions
-
-
-def load_embed_tokens(onnx_dir: str) -> np.ndarray:
-    """Load embedding matrix from raw binary file."""
-    config_path = os.path.join(onnx_dir, "config.json")
-    with open(config_path) as f:
-        config = json.load(f)
-
-    shape = config["embed_tokens_shape"]
-    embed_path = os.path.join(onnx_dir, "embed_tokens.bin")
-    embed = np.fromfile(embed_path, dtype=np.float32).reshape(shape)
-    print(f"  Loaded embed_tokens.bin: {embed.shape}")
-    return embed
+        providers.insert(0, "CUDAExecutionProvider")
+    return {
+        name: FiniteOutputSession(
+            ort.InferenceSession(os.path.join(onnx_dir, f"{name}.onnx"), providers=providers), name
+        )
+        for name in names
+    }
 
 
 def run_encoder_onnx(session, mel: np.ndarray) -> np.ndarray:
@@ -114,6 +117,8 @@ def greedy_decode_pytorch(
 
     Mirrors the ONNX decode logic for comparison.
     """
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
     with torch.no_grad():
         embed_weight = model.thinker.model.embed_tokens.weight.data
 
@@ -143,6 +148,8 @@ def greedy_decode_pytorch(
             return_dict=True,
         )
         logits = model.thinker.lm_head(outputs.last_hidden_state)
+        if not torch.isfinite(logits).all():
+            raise ValueError("Non-finite PyTorch decoder logits")
         past_key_values = outputs.past_key_values
 
         next_token = int(logits[0, -1, :].argmax())
@@ -168,6 +175,8 @@ def greedy_decode_pytorch(
                 return_dict=True,
             )
             logits = model.thinker.lm_head(outputs.last_hidden_state)
+            if not torch.isfinite(logits).all():
+                raise ValueError("Non-finite PyTorch decoder logits")
             past_key_values = outputs.past_key_values
 
             next_token = int(logits[0, -1, :].argmax())
@@ -180,62 +189,77 @@ def greedy_decode_pytorch(
     return output_tokens
 
 
-def validate_encoder(model, sessions, mel_np, mel_torch, device):
-    """Compare encoder outputs between PyTorch and ONNX."""
-    print("\n=== Encoder Validation ===")
+def compare_features(reference, actual, label, *, atol=1e-4, rtol=0.0):
+    if reference.shape != actual.shape or reference.ndim != 3 or not reference.size:
+        raise ValueError(f"{label}: feature shape mismatch: {reference.shape} vs {actual.shape}")
+    if not np.isfinite(reference).all() or not np.isfinite(actual).all():
+        raise ValueError(f"{label}: non-finite encoder features")
+    error = np.abs(reference - actual)
+    denominator = np.linalg.norm(reference.ravel())
+    relative_l2 = (
+        np.linalg.norm(error.ravel()) / denominator if denominator else (0.0 if not error.any() else float("inf"))
+    )
+    print(
+        f"{label}: max absolute diff {error.max():.6e}, mean {error.mean():.6e}, relative L2 {relative_l2:.6e}, atol={atol}, rtol={rtol}"
+    )
+    if not np.allclose(actual, reference, atol=atol, rtol=rtol):
+        raise ValueError(f"{label}: encoder features exceed atol={atol}, rtol={rtol}")
+    print(f"PASS: {label}")
 
-    # PyTorch
-    t0 = time.time()
+
+def validate_encoder(model, sessions, mel_np, mel_torch, device, *, atol=1e-4, rtol=0.0):
+    from src.native_encoder import run_native_encoder
+
+    with torch.no_grad():
+        native_features = run_native_encoder(model.thinker.audio_tower, mel_torch).cpu().numpy()
     pt_features = run_encoder_pytorch(model, mel_torch).cpu().numpy()
-    pt_time = time.time() - t0
-
-    # ONNX
-    t0 = time.time()
     onnx_features = run_encoder_onnx(sessions["encoder"], mel_np)
-    onnx_time = time.time() - t0
-
-    max_diff = np.max(np.abs(pt_features - onnx_features))
-    mean_diff = np.mean(np.abs(pt_features - onnx_features))
-
-    print(f"  PyTorch output shape: {pt_features.shape}")
-    print(f"  ONNX output shape:    {onnx_features.shape}")
-    print(f"  Max absolute diff:    {max_diff:.6e}")
-    print(f"  Mean absolute diff:   {mean_diff:.6e}")
-    print(f"  PyTorch time:         {pt_time:.3f}s")
-    print(f"  ONNX time:            {onnx_time:.3f}s")
-
-    if max_diff > 1e-4:
-        print("  WARNING: Max diff exceeds 1e-4 threshold")
-    else:
-        print("  PASS: Encoder outputs match within tolerance")
-
-    return pt_features, onnx_features
+    compare_features(native_features, pt_features, "native vs wrapper", atol=atol, rtol=rtol)
+    compare_features(pt_features, onnx_features, "wrapper vs ONNX", atol=atol, rtol=rtol)
+    compare_features(native_features, onnx_features, "native vs ONNX", atol=atol, rtol=rtol)
+    return native_features, onnx_features
 
 
-def validate_pipeline(model, sessions, embed_tokens, audio_features_pt, audio_features_onnx, tokenizer, device):
+def validate_pipeline(
+    model,
+    sessions,
+    embed_tokens,
+    audio_features_pt,
+    audio_features_onnx,
+    tokenizer,
+    device,
+    max_tokens=256,
+    onnx_tokenizer=None,
+):
     """Compare full pipeline (encode -> decode) between PyTorch and ONNX."""
     print("\n=== Pipeline Validation ===")
 
     # Build prompt
     audio_token_count = audio_features_pt.shape[1]
-    prompt_ids = build_prompt_ids(audio_token_count)
+    prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
+    artifact_tokenizer = tokenizer if onnx_tokenizer is None else onnx_tokenizer
+    artifact_prompt = build_prompt_ids(audio_token_count, artifact_tokenizer)
+    if artifact_prompt != prompt_ids:
+        raise ValueError("Artifact prompt IDs do not match the checkpoint")
     print(f"  Prompt length: {len(prompt_ids)} tokens ({audio_token_count} audio tokens)")
 
     # PyTorch decode
     print("  Running PyTorch decode...")
     t0 = time.time()
-    pt_tokens = greedy_decode_pytorch(model, audio_features_pt, prompt_ids, device=device)
+    pt_tokens = greedy_decode_pytorch(model, audio_features_pt, prompt_ids, max_tokens=max_tokens, device=device)
     pt_time = time.time() - t0
 
     # ONNX decode
     print("  Running ONNX decode...")
     t0 = time.time()
-    onnx_tokens = greedy_decode_onnx(sessions, embed_tokens, audio_features_onnx, prompt_ids)
+    onnx_tokens = greedy_decode_onnx(
+        sessions, embed_tokens, audio_features_onnx, artifact_prompt, max_tokens=max_tokens
+    )
     onnx_time = time.time() - t0
 
     # Decode to text
     pt_text = tokenizer.decode(pt_tokens, skip_special_tokens=True)
-    onnx_text = tokenizer.decode(onnx_tokens, skip_special_tokens=True)
+    onnx_text = artifact_tokenizer.decode(onnx_tokens, skip_special_tokens=True)
 
     print(f"\n  PyTorch text ({len(pt_tokens)} tokens, {pt_time:.2f}s):")
     print(f"    {pt_text}")
@@ -247,17 +271,12 @@ def validate_pipeline(model, sessions, embed_tokens, audio_features_pt, audio_fe
     total = max(len(pt_tokens), len(onnx_tokens))
     print(f"\n  Token match: {match_count}/{total}")
 
+    if pt_text != onnx_text:
+        raise ValueError(f"Transcript mismatch: PyTorch={pt_text!r}, ONNX={onnx_text!r}")
     if pt_tokens == onnx_tokens:
         print("  PASS: Exact token-for-token match")
-    elif pt_text == onnx_text:
-        print("  PASS: Text matches (minor token differences)")
     else:
-        print("  WARN: Text differs between PyTorch and ONNX")
-        # Show first divergence
-        for i, (a, b) in enumerate(zip(pt_tokens, onnx_tokens)):
-            if a != b:
-                print(f"  First divergence at position {i}: PT={a} ONNX={b}")
-                break
+        print("  PASS: Text matches (minor token differences)")
 
 
 def main():
@@ -267,7 +286,17 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3-ASR-0.6B", help="HuggingFace model ID")
     parser.add_argument("--device", default="cpu", help="Device for PyTorch model")
     parser.add_argument("--max-tokens", type=int, default=256, help="Max decode tokens")
+    parser.add_argument("--atol", type=float, default=1e-4, help="Encoder absolute tolerance")
+    parser.add_argument("--rtol", type=float, default=0.0, help="Encoder relative tolerance")
     args = parser.parse_args()
+    if args.max_tokens <= 0:
+        parser.error("--max-tokens must be positive")
+    if not np.isfinite(args.atol) or not np.isfinite(args.rtol) or args.atol < 0 or args.rtol < 0:
+        parser.error("tolerances must be finite and nonnegative")
+
+    print("\nLoading ONNX sessions...")
+    sessions = load_onnx_sessions(args.onnx_dir)
+    artifact_tokenizer = validate_tokenizer_assets(args.onnx_dir)
 
     # Load audio
     print("Loading audio...")
@@ -290,37 +319,32 @@ def main():
     print("\nLoading PyTorch model...")
     model = load_pytorch_model(args.model, device=args.device)
 
-    print("\nLoading ONNX sessions...")
-    sessions = load_onnx_sessions(args.onnx_dir)
-
     print("\nLoading embedding matrix...")
     embed_tokens = load_embed_tokens(args.onnx_dir)
 
     print("\nLoading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = load_prompt_tokenizer(args.model)
 
-    # Validate encoder
-    if "encoder" in sessions:
-        pt_features, onnx_features = validate_encoder(model, sessions, mel_np, mel_torch, args.device)
-    else:
-        print("\nSkipping encoder validation (no encoder.onnx)")
-        pt_features = run_encoder_pytorch(model, mel_torch).cpu().numpy()
-        onnx_features = pt_features
-
-    # Validate pipeline
-    if "decoder_init" in sessions and "decoder_step" in sessions:
-        pt_features_torch = torch.from_numpy(pt_features).to(args.device)
-        validate_pipeline(
-            model,
-            sessions,
-            embed_tokens,
-            pt_features_torch,
-            onnx_features,
-            tokenizer,
-            args.device,
-        )
-    else:
-        print("\nSkipping pipeline validation (missing decoder ONNX files)")
+    pt_features, onnx_features = validate_encoder(
+        model,
+        sessions,
+        mel_np,
+        mel_torch,
+        args.device,
+        atol=args.atol,
+        rtol=args.rtol,
+    )
+    validate_pipeline(
+        model,
+        sessions,
+        embed_tokens,
+        torch.from_numpy(pt_features).to(args.device),
+        onnx_features,
+        tokenizer,
+        args.device,
+        max_tokens=args.max_tokens,
+        onnx_tokenizer=artifact_tokenizer,
+    )
 
 
 if __name__ == "__main__":

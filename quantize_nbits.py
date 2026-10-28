@@ -45,6 +45,8 @@ from onnxruntime.quantization.matmul_nbits_quantizer import (
 )
 from onnxruntime.quantization.quant_utils import QuantFormat
 
+from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
+
 
 class NpzCalibrationReader(CalibrationDataReader):
     """Feeds pre-collected input dicts from a numpy .npz file to GPTQ."""
@@ -186,6 +188,10 @@ def main():
         help="MatMul node names to exclude from quantization (keep at FP32)",
     )
     args = parser.parse_args()
+    if tokenizer_asset_names(args.input):
+        validate_tokenizer_assets(args.input)
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -198,7 +204,9 @@ def main():
             print(f"  Skipping {name}.onnx (not found)")
             continue
         dst = os.path.join(args.output, f"{name}{bits_suffix}.onnx")
-        quantize_decoder(src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data, args.nodes_to_exclude)
+        quantize_decoder(
+            src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data, args.nodes_to_exclude
+        )
         quantized_names.add(name)
 
     # Copy non-quantized files from input to output (encoder, tokenizer, config, etc.)
@@ -213,6 +221,9 @@ def main():
             if os.path.isfile(src):
                 shutil.copy2(src, dst)
                 print(f"  Copied {fname}")
+
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     # Update config.json quantization field (merge with existing for split-decoder runs)
     config_path = os.path.join(args.output, "config.json")

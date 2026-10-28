@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .onnx_export import export_onnx
+
 CONV_WINDOW = 100  # n_window * 2
 TOKENS_PER_WINDOW = 13  # tokens output by conv on a full 100-frame window
 ATTN_WINDOW_SIZE = 104  # TOKENS_PER_WINDOW * (n_window_infer // conv_window) = 13 * 8
@@ -107,8 +109,8 @@ class EncoderWrapper(nn.Module):
     Reimplements the Qwen3ASRAudioEncoder forward pass with windowed
     convolution and windowed attention, using ONNX-traceable operations.
 
-    All control flow is branch-free (no data-dependent if/else) to ensure
-    correct tracing under torch.export / torch.onnx.export.
+    Tensor-based shape calculations preserve dynamic time lengths with the
+    legacy ONNX exporter.
     """
 
     def __init__(self, audio_tower):
@@ -140,6 +142,7 @@ class EncoderWrapper(nn.Module):
             [1, valid_count, output_dim] audio features.
         """
         T = mel.shape[2]
+        conv_width = torch._shape_as_tensor(mel)[2].clamp(max=CONV_WINDOW)
 
         # --- Stage 1: Windowed Conv2D ---
         # Pad T to next multiple of CONV_WINDOW (no-op when already aligned)
@@ -149,15 +152,21 @@ class EncoderWrapper(nn.Module):
         num_conv_windows = T_padded // CONV_WINDOW
 
         # [1, 128, T_padded] -> [N, 1, 128, CONV_WINDOW]
-        assert mel.shape[0] == 1, f"Expected batch=1, got {mel.shape[0]}"
+        if not torch.onnx.is_in_onnx_export():
+            assert mel.shape[0] == 1, f"Expected batch=1, got {mel.shape[0]}"
         x = mel.squeeze(0)  # [128, T_padded]
         x = x.reshape(128, num_conv_windows, CONV_WINDOW)  # [128, N, 100]
         x = x.permute(1, 0, 2)  # [N, 128, 100]
         x = x.unsqueeze(1)  # [N, 1, 128, 100]
 
-        # Conv2D stem
+        # Native single-chunk convolutions have width min(T, 100). Masking
+        # between layers preserves their zero-padding boundaries after batching.
         x = F.gelu(self.conv2d1(x))
+        conv_width = _conv_out_len(conv_width)
+        x = x * (torch.arange(x.shape[-1], device=x.device) < conv_width).to(x.dtype)
         x = F.gelu(self.conv2d2(x))
+        conv_width = _conv_out_len(conv_width)
+        x = x * (torch.arange(x.shape[-1], device=x.device) < conv_width).to(x.dtype)
         x = F.gelu(self.conv2d3(x))
 
         # [N, 480, 16, tokens_per_window] -> [N, tokens_per_window, 7680] -> [N, tpw, 896]
@@ -225,7 +234,7 @@ def export_encoder(
         )
 
     with torch.no_grad():
-        torch.onnx.export(
+        n = export_onnx(
             wrapper,
             (dummy_mel,),
             output_path,
@@ -239,7 +248,4 @@ def export_encoder(
             do_constant_folding=True,
         )
 
-    from .onnx_fixup import fix_reshape_allowzero
-
-    n = fix_reshape_allowzero(output_path)
     print(f"Encoder exported to {output_path} (fixed {n} Reshape allowzero attrs)")

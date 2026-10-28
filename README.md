@@ -1,5 +1,8 @@
 # Qwen3-ASR ONNX Export Tool
 
+See [reproducible validation](VALIDATION.md) for the supported locked environment,
+offline regression suite and explicit checkpoint checks.
+
 Export [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) and [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) to ONNX format for use with ONNX Runtime.
 
 Pre-exported models on HuggingFace:
@@ -186,13 +189,13 @@ python quantize.py \
     --output output/qwen3-asr-0.6b
 ```
 
-α=0.2 is the optimal smoothing strength for 0.6B INT8. Calibration activations are cached in the smooth output directory (`calibration_activations.npz`). To sweep alpha values without re-collecting:
+The existing 0.6B recipe uses alpha 0.2. Calibration data must be collected with the current model and prompt contract. Existing caches have no verified provenance and are preserved and rejected. Choose a clean output or cache path for each run; alpha sweeps currently require fresh collection.
 
 ```bash
 python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
-    --output output/qwen3-asr-0.6b-smooth \
-    --alpha 0.2 \
-    --activations-cache output/qwen3-asr-0.6b-smooth/calibration_activations.npz
+    --output output/qwen3-asr-0.6b-smooth-alpha-02 \
+    --alpha 0.2 --n-samples 128 \
+    --activations-cache output/qwen3-asr-0.6b-smooth-alpha-02/fresh-calibration.npz
 ```
 
 ### Evaluate WER

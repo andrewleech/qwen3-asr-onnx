@@ -7,7 +7,6 @@ Requires:
     - Qwen3-ASR-0.6B model accessible
 """
 
-import json
 import os
 
 import numpy as np
@@ -15,12 +14,12 @@ import onnxruntime as ort
 import pytest
 import soundfile as sf
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel
 
 from src.encoder_wrapper import EncoderWrapper
 from src.inference import greedy_decode_onnx
 from src.mel import log_mel_spectrogram
-from src.prompt import EOS_TOKEN_IDS, build_prompt_ids, get_audio_pad_range
+from src.prompt import EOS_TOKEN_IDS, build_prompt_ids, get_audio_pad_range, load_prompt_tokenizer
 
 OUTPUT_DIR = "output/qwen3-asr-0.6b"
 AUDIO_PATH = "tests/fixtures/test_audio.wav"
@@ -81,7 +80,7 @@ def pytorch_model():
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    return AutoTokenizer.from_pretrained("Qwen/Qwen3-ASR-0.6B", trust_remote_code=True)
+    return load_prompt_tokenizer("Qwen/Qwen3-ASR-0.6B")
 
 
 @pytest.fixture(scope="module")
@@ -98,14 +97,9 @@ def onnx_sessions():
 
 @pytest.fixture(scope="module")
 def embed_tokens():
-    config_path = os.path.join(OUTPUT_DIR, "config.json")
-    with open(config_path) as f:
-        config = json.load(f)
-    shape = config["embed_tokens_shape"]
-    return np.fromfile(
-        os.path.join(OUTPUT_DIR, "embed_tokens.bin"),
-        dtype=np.float32,
-    ).reshape(shape)
+    from src.embeddings import load_embed_tokens
+
+    return load_embed_tokens(OUTPUT_DIR)
 
 
 def decode_pytorch(model, audio_features, prompt_ids, max_tokens=256):
@@ -184,7 +178,7 @@ class TestPipeline:
         onnx_features = onnx_sessions["encoder"].run(["audio_features"], {"mel": mel_np})[0]
 
         audio_token_count = pt_features.shape[1]
-        prompt_ids = build_prompt_ids(audio_token_count)
+        prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
 
         # Decode both
         pt_tokens = decode_pytorch(pytorch_model, pt_features, prompt_ids)
@@ -205,13 +199,13 @@ class TestPipeline:
             f"Token match rate {match_rate:.1%} below 95% threshold. PT: {pt_text!r}, ONNX: {onnx_text!r}"
         )
 
-    def test_greedy_deterministic(self, onnx_sessions, embed_tokens, mel):
+    def test_greedy_deterministic(self, onnx_sessions, embed_tokens, mel, tokenizer):
         """Running ONNX decode twice should produce identical output."""
         mel_np = mel.numpy()
         features = onnx_sessions["encoder"].run(["audio_features"], {"mel": mel_np})[0]
 
         audio_token_count = features.shape[1]
-        prompt_ids = build_prompt_ids(audio_token_count)
+        prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
 
         tokens_1 = greedy_decode_onnx(onnx_sessions, embed_tokens, features, prompt_ids)
         tokens_2 = greedy_decode_onnx(onnx_sessions, embed_tokens, features, prompt_ids)

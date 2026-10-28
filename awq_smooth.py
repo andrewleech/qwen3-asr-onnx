@@ -49,7 +49,8 @@ from export import (
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
 from src.mel import log_mel_spectrogram
-from src.prompt import build_prompt_ids
+from src.onnx_artifacts import external_data_files
+from src.prompt import build_prompt_ids, load_prompt_tokenizer
 from validate import greedy_decode_pytorch, run_encoder_pytorch
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,7 @@ from validate import greedy_decode_pytorch, run_encoder_pytorch
 def collect_activations(
     model,
     n_samples: int,
+    tokenizer,
     device: str = "cpu",
 ) -> dict[str, torch.Tensor]:
     """
@@ -145,7 +147,7 @@ def collect_activations(
             if audio_token_count == 0:
                 continue
 
-            prompt_ids = build_prompt_ids(audio_token_count)
+            prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
             # Hooks accumulate on every decoder forward call inside greedy_decode_pytorch
             greedy_decode_pytorch(
                 model,
@@ -268,6 +270,7 @@ def verify_equivalence(
     original_model,
     smoothed_model,
     test_audio_path: str,
+    tokenizer,
     device: str = "cpu",
 ) -> bool:
     """
@@ -289,7 +292,7 @@ def verify_equivalence(
     mel = log_mel_spectrogram(audio, device=device)
     # Encoder not modified — run on original, reuse features for both
     audio_features = run_encoder_pytorch(original_model, mel)
-    prompt_ids = build_prompt_ids(audio_features.shape[1])
+    prompt_ids = build_prompt_ids(audio_features.shape[1], tokenizer)
 
     print("  Original model...")
     orig_tokens = greedy_decode_pytorch(original_model, audio_features, prompt_ids, device=device)
@@ -380,8 +383,8 @@ def main():
         "--activations-cache",
         type=str,
         default=None,
-        help="Path to .npz file for loading/saving calibration activations. "
-        "If the file exists, calibration is skipped (useful for alpha sweeps).",
+        help="Path for freshly collected activations (.npz is appended if missing). "
+        "Existing unverifiable caches are preserved and rejected.",
     )
     parser.add_argument(
         "--device",
@@ -408,24 +411,24 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
-    # Determine activations cache path
     acts_cache = args.activations_cache or os.path.join(args.output, "calibration_activations.npz")
+    if not acts_cache.endswith(".npz"):
+        acts_cache += ".npz"
+
+    if os.path.lexists(acts_cache):
+        raise ValueError(
+            f"Unverifiable calibration cache {acts_cache}; preserve it and choose a clean cache path for fresh collection"
+        )
 
     # Load model
     model = load_model(args.model, device=args.device, dtype=torch.float32)
+    tokenizer = load_prompt_tokenizer(args.model)
 
-    # Collect or load calibration activations
-    if os.path.exists(acts_cache):
-        print(f"Loading cached activations from {acts_cache}")
-        data = np.load(acts_cache)
-        activations = {k: torch.from_numpy(data[k]) for k in data.files}
-        print(f"  Loaded {len(activations)} activation vectors")
-    else:
-        t0 = time.time()
-        activations = collect_activations(model, n_samples=args.n_samples, device=args.device)
-        print(f"  Collection done in {time.time() - t0:.1f}s")
-        np.savez(acts_cache, **{k: v.numpy() for k, v in activations.items()})
-        print(f"  Activations saved to {acts_cache}")
+    t0 = time.time()
+    activations = collect_activations(model, n_samples=args.n_samples, tokenizer=tokenizer, device=args.device)
+    print(f"  Collection done in {time.time() - t0:.1f}s")
+    np.savez(acts_cache, **{k: v.numpy() for k, v in activations.items()})
+    print(f"  Activations saved to {acts_cache}")
 
     # Compute smoothing scales
     print(f"\nComputing scales (alpha={args.alpha})...")
@@ -453,7 +456,7 @@ def main():
     # Verify equivalence
     if args.verify and model_orig is not None:
         print(f"\nVerifying equivalence on {args.verify_audio}...")
-        ok = verify_equivalence(model_orig, model, args.verify_audio, device=args.device)
+        ok = verify_equivalence(model_orig, model, args.verify_audio, tokenizer=tokenizer, device=args.device)
         if not ok:
             print("WARNING: Smoothed model produces different tokens — review implementation")
 
@@ -462,12 +465,10 @@ def main():
         print("\n=== Exporting encoder ===")
         encoder_path = os.path.join(args.output, "encoder.onnx")
         export_encoder(model, encoder_path, opset_version=args.opset, device=args.device)
-        encoder_data = encoder_path + ".data"
-        if os.path.exists(encoder_data):
+        if external_data_files(encoder_path):
             print("  Embedding encoder weights into .onnx proto...")
             enc = onnx.load(encoder_path, load_external_data=True)
             onnx.save(enc, encoder_path)
-            os.remove(encoder_data)
     else:
         print("\n=== Encoder skipped (--skip-encoder) ===")
 

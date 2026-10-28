@@ -27,14 +27,16 @@ import subprocess
 
 import numpy as np
 
+from src.tokenizer_assets import TOKENIZER_FILES, validate_tokenizer_assets
+
 # FP32 model files (encoder weights inlined, decoder weights in shared file)
 FP32_FILES = [
     "encoder.onnx",
     "decoder_init.onnx",
     "decoder_step.onnx",
-    "decoder_weights.data",          # shared external weights (from share_weights.py)
-    "decoder_init.onnx.data",        # fallback: per-decoder data (pre-sharing format)
-    "decoder_step.onnx.data",        # fallback: per-decoder data (pre-sharing format)
+    "decoder_weights.data",  # shared external weights (from share_weights.py)
+    "decoder_init.onnx.data",  # fallback: per-decoder data (pre-sharing format)
+    "decoder_step.onnx.data",  # fallback: per-decoder data (pre-sharing format)
 ]
 
 # int4 model files
@@ -43,9 +45,9 @@ INT4_FILES = [
     "encoder.int4.onnx",
     "decoder_init.int4.onnx",
     "decoder_step.int4.onnx",
-    "decoder_weights.int4.data",     # shared external weights (from share_weights.py --suffix int4)
-    "decoder_init.int4.onnx.data",   # fallback: per-decoder data (pre-sharing format)
-    "decoder_step.int4.onnx.data",   # fallback: per-decoder data (pre-sharing format)
+    "decoder_weights.int4.data",  # shared external weights (from share_weights.py --suffix int4)
+    "decoder_init.int4.onnx.data",  # fallback: per-decoder data (pre-sharing format)
+    "decoder_step.int4.onnx.data",  # fallback: per-decoder data (pre-sharing format)
 ]
 
 # Shared across all variants
@@ -53,10 +55,7 @@ SHARED_FILES = [
     # embed_tokens.bin handled separately (FP16 conversion)
     "config.json",
     "preprocessor_config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "added_tokens.json",
-    "vocab.json",
+    *sorted(TOKENIZER_FILES),
 ]
 
 
@@ -131,6 +130,7 @@ def verify_ort_load(output_dir):
 
 def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     """Package FP32 + int4 variants from consolidated input directory."""
+    validate_tokenizer_assets(input_dir)
 
     if os.path.exists(output_dir):
         assert os.path.realpath(output_dir) != os.path.realpath(input_dir), "output must differ from input"
@@ -236,6 +236,8 @@ def package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     if not verify_ort_load(output_dir):
         print("ERROR: ORT verification failed")
         return False
+
+    validate_tokenizer_assets(output_dir)
 
     # Create per-variant tarballs (FP32 and int4) in the output directory's parent.
     # Each tarball contains shared files + variant-specific ONNX files.

@@ -16,8 +16,10 @@ import subprocess
 
 from huggingface_hub import HfApi
 
+from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
+
 # Shared metadata files included in every archive
-METADATA = ["embed_tokens.bin", "config.json", "tokenizer.json"]
+METADATA = ["embed_tokens.bin", "config.json", "tokenizer.json", "tokenizer_config.json"]
 
 # Archives are built from release/ dirs (produced by package.py), which contain
 # the correct FP16 embed_tokens.bin and patched config.json.
@@ -75,7 +77,8 @@ def create_tar(archive, output_dir):
     """Create a tar.gz archive with the correct directory structure."""
     name = archive["name"]
     source_dir = archive["source_dir"]
-    all_files = archive["files"] + METADATA
+    validate_tokenizer_assets(source_dir)
+    all_files = sorted(set(archive["files"]) | set(METADATA) | tokenizer_asset_names(source_dir))
     tar_path = os.path.join(output_dir, f"{name}.tar.gz")
 
     # Verify all source files exist

@@ -29,7 +29,6 @@ Usage:
 """
 
 import argparse
-import json
 import os
 
 import numpy as np
@@ -53,18 +52,9 @@ def load_sessions(model_dir: str, threads: int) -> dict:
 
 def load_embed(model_dir: str) -> np.ndarray:
     """Load embed_tokens.bin as float32 [vocab, hidden]."""
-    config_path = os.path.join(model_dir, "config.json")
-    with open(config_path) as f:
-        cfg = json.load(f)
-    dtype_str = cfg.get("embed_tokens_dtype", "float32")
-    # v3 format: derive shape from decoder config (no embed_tokens_shape in config)
-    if "embed_tokens_shape" in cfg:
-        shape = cfg["embed_tokens_shape"]
-    else:
-        shape = [cfg["decoder"]["vocab_size"], cfg["decoder"]["hidden_size"]]
-    dtype = np.float16 if dtype_str == "float16" else np.float32
-    embed = np.fromfile(os.path.join(model_dir, "embed_tokens.bin"), dtype=dtype).reshape(shape)
-    return embed.astype(np.float32)
+    from src.embeddings import load_embed_tokens
+
+    return load_embed_tokens(model_dir)
 
 
 def stream_audio(n: int):
@@ -104,7 +94,7 @@ def stream_audio(n: int):
         yielded += 1
 
 
-def collect_init_inputs(sessions, embed_tokens, n_samples, verbose=True):
+def collect_init_inputs(sessions, embed_tokens, n_samples, tokenizer, verbose=True):
     """Collect decoder_init input dicts from n_samples audio files."""
     from src.mel import log_mel_spectrogram
     from src.prompt import build_prompt_ids, get_audio_pad_range
@@ -122,7 +112,7 @@ def collect_init_inputs(sessions, embed_tokens, n_samples, verbose=True):
         if audio_token_count == 0:
             continue
 
-        prompt_ids = build_prompt_ids(audio_token_count)
+        prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
         audio_start, _ = get_audio_pad_range(prompt_ids)
         input_ids = np.array(prompt_ids, dtype=np.int64)[np.newaxis, :]
         position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
@@ -140,7 +130,7 @@ def collect_init_inputs(sessions, embed_tokens, n_samples, verbose=True):
     return inputs
 
 
-def collect_step_inputs(sessions, embed_tokens, n_samples, decoder_steps, verbose=True):
+def collect_step_inputs(sessions, embed_tokens, n_samples, decoder_steps, tokenizer, verbose=True):
     """Collect decoder_step input dicts (with real KV cache) from n_samples audio files."""
     from src.mel import log_mel_spectrogram
     from src.prompt import EOS_TOKEN_IDS, build_prompt_ids, get_audio_pad_range
@@ -158,7 +148,7 @@ def collect_step_inputs(sessions, embed_tokens, n_samples, decoder_steps, verbos
         if audio_token_count == 0:
             continue
 
-        prompt_ids = build_prompt_ids(audio_token_count)
+        prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
         audio_start, _ = get_audio_pad_range(prompt_ids)
         input_ids = np.array(prompt_ids, dtype=np.int64)[np.newaxis, :]
         position_ids = np.arange(len(prompt_ids), dtype=np.int64)[np.newaxis, :]
@@ -232,16 +222,19 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading model from {args.model} ...")
+    from src.prompt import load_prompt_tokenizer
+
+    tokenizer = load_prompt_tokenizer(args.model)
     sessions = load_sessions(args.model, args.threads)
     embed_tokens = load_embed(args.model)
     print(f"  embed_tokens: {embed_tokens.shape}")
 
     if args.target == "decoder_init":
         print(f"\nCollecting {args.n_samples} decoder_init samples ...")
-        data = collect_init_inputs(sessions, embed_tokens, args.n_samples)
+        data = collect_init_inputs(sessions, embed_tokens, args.n_samples, tokenizer)
     else:
         print(f"\nCollecting {args.n_samples} × {args.decoder_steps} decoder_step samples ...")
-        data = collect_step_inputs(sessions, embed_tokens, args.n_samples, args.decoder_steps)
+        data = collect_step_inputs(sessions, embed_tokens, args.n_samples, args.decoder_steps, tokenizer)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     save_dict = {"_n_samples": np.array(len(data))}
