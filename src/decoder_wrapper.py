@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .onnx_export import export_onnx
+
 # Qwen3-0.6B decoder dimensions (kept for test compatibility; wrappers read from text_config)
 NUM_LAYERS = 28
 NUM_Q_HEADS = 16
@@ -334,7 +336,7 @@ def export_decoder_init(
     }
 
     with torch.no_grad():
-        torch.onnx.export(
+        n = export_onnx(
             wrapper,
             (dummy_ids, dummy_pos, dummy_audio, dummy_offset),
             output_path,
@@ -345,9 +347,6 @@ def export_decoder_init(
             do_constant_folding=True,
         )
 
-    from .onnx_fixup import fix_reshape_allowzero
-
-    n = fix_reshape_allowzero(output_path)
     print(f"Decoder init exported to {output_path} (fixed {n} Reshape allowzero attrs)")
 
 
@@ -405,7 +404,7 @@ def export_decoder_step(
     args = (dummy_embeds, dummy_pos, dummy_past_keys, dummy_past_values)
 
     with torch.no_grad():
-        torch.onnx.export(
+        n = export_onnx(
             wrapper,
             args,
             output_path,
@@ -416,7 +415,4 @@ def export_decoder_step(
             do_constant_folding=True,
         )
 
-    from .onnx_fixup import fix_reshape_allowzero
-
-    n = fix_reshape_allowzero(output_path)
     print(f"Decoder step exported to {output_path} (fixed {n} Reshape allowzero attrs)")

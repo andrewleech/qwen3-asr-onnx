@@ -33,7 +33,7 @@ uv run python quantize_nbits.py \
 - `--algo gptq`: requires `--calib-data` from `collect_gptq_calib.py`
 - `--decoders`: which decoders to quantize (default: both)
 - Writes suffixed files (`decoder_init.int4.onnx` + `.data`) alongside FP32
-- GPTQ creates ~6.5 GB temp `.data` files in source dir — clean up after
+- GPTQ owns temporary graph/data staging outside the source directory; no source cleanup is needed.
 
 ## collect_gptq_calib.py — GPTQ calibration data
 

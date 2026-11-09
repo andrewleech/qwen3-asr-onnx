@@ -49,10 +49,6 @@ uv run python quantize_nbits.py \
     --bits 4 --block-size 64 --accuracy-level 4 \
     --algo rtn --decoders decoder_step
 
-# Step 4: Clean GPTQ temp files from source dir
-echo "--- Cleaning GPTQ temp files ---"
-rm -f "$MODEL_DIR"/*-*-*-*-*.data "$MODEL_DIR"/*_augment.onnx 2>/dev/null || true
-
 echo ""
 echo "================================================================"
 echo "=== [106] RTN al4 both decoders (block_size=32)             ==="

@@ -10,7 +10,6 @@ Requires:
     - Audio fixtures in tests/fixtures/
 """
 
-import json
 import os
 import re
 
@@ -18,7 +17,6 @@ import numpy as np
 import pytest
 import soundfile as sf
 import torch
-from transformers import AutoTokenizer
 
 from compare import (
     load_onnx_sessions,
@@ -27,6 +25,7 @@ from compare import (
     run_wrapper_pytorch,
     strip_asr_prefix,
 )
+from src.prompt import load_prompt_tokenizer
 
 # ---------------------------------------------------------------------------
 # Sample definitions
@@ -136,10 +135,7 @@ def processor():
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    return AutoTokenizer.from_pretrained(
-        "Qwen/Qwen3-ASR-0.6B",
-        trust_remote_code=True,
-    )
+    return load_prompt_tokenizer("Qwen/Qwen3-ASR-0.6B")
 
 
 @pytest.fixture(scope="module")
@@ -155,14 +151,9 @@ def int8_sessions():
 
 
 def _load_embed(onnx_dir):
-    with open(os.path.join(onnx_dir, "config.json")) as f:
-        cfg = json.load(f)
-    dtype = np.dtype(cfg.get("embed_tokens_dtype", "float32"))
-    embed = np.fromfile(
-        os.path.join(onnx_dir, "embed_tokens.bin"),
-        dtype=dtype,
-    ).reshape(cfg["embed_tokens_shape"])
-    return embed.astype(np.float32)
+    from src.embeddings import load_embed_tokens
+
+    return load_embed_tokens(onnx_dir)
 
 
 @pytest.fixture(scope="module")

@@ -18,13 +18,17 @@ Usage:
 import argparse
 import json
 import os
+from pathlib import Path
 
 import onnx
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel
 
+from src.artifact_publication import ArtifactStaging
+from src.artifact_sources import validate_publication_sources
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
+from src.onnx_artifacts import external_data_files, preflight_artifact_mutations, write_artifact_json
 from src.prompt import (
     ASR_TEXT_TOKEN_ID,
     AUDIO_END_TOKEN_ID,
@@ -34,6 +38,15 @@ from src.prompt import (
     EOS_TOKEN_IDS,
     IM_END_TOKEN_ID,
     IM_START_TOKEN_ID,
+    load_prompt_tokenizer,
+    validate_prompt_tokenizer,
+)
+from src.tokenizer_assets import (
+    TOKENIZER_FILES,
+    copy_tokenizer_assets,
+    tokenizer_checkpoint_reads,
+    validate_tokenizer_assets,
+    validate_tokenizer_destination,
 )
 
 
@@ -74,56 +87,25 @@ def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
 
 
 def copy_tokenizer(model_id: str, output_dir: str):
-    """Copy tokenizer.json from the HuggingFace model."""
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-
-    # Save tokenizer files
-    tokenizer.save_pretrained(output_dir)
-
-    # Remove unwanted files from save_pretrained, keep only tokenizer files
-    keep_files = {"tokenizer.json", "tokenizer_config.json"}
-    remove_extensions = {".py", ".txt"}
-    for f in os.listdir(output_dir):
-        if f in keep_files:
-            continue
-        path = os.path.join(output_dir, f)
-        _, ext = os.path.splitext(f)
-        if ext in remove_extensions or f == "special_tokens_map.json":
-            os.remove(path)
-
+    validate_tokenizer_destination(output_dir)
+    tokenizer = load_prompt_tokenizer(model_id)
+    validate_publication_sources(
+        tokenizer_checkpoint_reads(model_id, tokenizer),
+        files=(Path(output_dir) / name for name in TOKENIZER_FILES),
+    )
+    tokenizer.chat_template = tokenizer.get_chat_template()
+    with ArtifactStaging(prefix="qwen-tokenizer-export-", dir=None) as staging:
+        tokenizer.save_pretrained(staging.path)
+        validate_tokenizer_assets(staging.path)
+        copy_tokenizer_assets(staging.path, output_dir)
+        staging.mark_complete()
     print(f"Tokenizer saved to {output_dir}")
 
 
 def verify_special_tokens(model_id: str):
-    """
-    Verify special token IDs match our constants.
-
-    Loads the tokenizer and checks that the token IDs we hardcoded
-    in prompt.py match the actual tokenizer.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-
-    checks = {
-        "<|audio_start|>": AUDIO_START_TOKEN_ID,
-        "<|audio_end|>": AUDIO_END_TOKEN_ID,
-        "<|audio_pad|>": AUDIO_PAD_TOKEN_ID,
-        "<|im_start|>": IM_START_TOKEN_ID,
-        "<|im_end|>": IM_END_TOKEN_ID,
-        "<|endoftext|>": ENDOFTEXT_TOKEN_ID,
-    }
-
-    all_ok = True
-    for token_str, expected_id in checks.items():
-        actual_id = tokenizer.convert_tokens_to_ids(token_str)
-        if actual_id != expected_id:
-            print(f"  MISMATCH: {token_str} expected={expected_id} actual={actual_id}")
-            all_ok = False
-        else:
-            print(f"  OK: {token_str} = {actual_id}")
-
-    if not all_ok:
-        raise ValueError("Special token IDs do not match. Update src/prompt.py with correct values.")
-    print("All special token IDs verified.")
+    tokenizer = load_prompt_tokenizer(model_id)
+    validate_prompt_tokenizer(tokenizer)
+    print("All special token IDs and prompt roles verified.")
 
 
 def write_preprocessor_config(output_dir: str):
@@ -155,8 +137,9 @@ def write_preprocessor_config(output_dir: str):
     }
 
     output_path = os.path.join(output_dir, "preprocessor_config.json")
-    with open(output_path, "w") as f:
-        json.dump(config, f, indent=2)
+    root = Path(output_dir).resolve()
+    preflight_artifact_mutations(root, root, (), rewritten={"preprocessor_config.json"})
+    write_artifact_json(output_dir, "preprocessor_config.json", config)
     print(f"Preprocessor config saved to {output_path}")
 
 
@@ -173,6 +156,8 @@ def write_config(model, output_dir: str):
 
     config = {
         "model_type": "qwen3_asr",
+        "embed_tokens_shape": list(model.thinker.model.embed_tokens.weight.shape),
+        "embed_tokens_dtype": "float32",
         "encoder": {
             "num_layers": audio_config.encoder_layers,
             "hidden_size": audio_config.d_model,
@@ -250,9 +235,6 @@ def _convert_to_fp16(output_dir: str, filenames: list[str]):
         m = optimize_model(path, model_type="gpt2", opt_level=0)
         m.convert_float_to_float16(keep_io_types=True)
 
-        # Remove old external data before saving
-        if os.path.exists(data_path):
-            os.remove(data_path)
         m.save_model_to_file(path)
 
         size_after = os.path.getsize(path)
@@ -325,6 +307,7 @@ def main():
     if args.output is None:
         args.output = _default_output_dir(args.model)
 
+    validate_tokenizer_destination(args.output)
     os.makedirs(args.output, exist_ok=True)
 
     # Always load in FP32 initially — encoder needs FP32 for mel spectrogram input.
@@ -348,14 +331,10 @@ def main():
             opset_version=args.opset,
             device=args.device,
         )
-        # Embed encoder weights into the .onnx proto (eliminates encoder.onnx.data).
-        # Safe for all model sizes: 0.6B=751MB, 1.7B=1.28GB — well under protobuf 2GB limit.
-        encoder_data = encoder_path + ".data"
-        if os.path.exists(encoder_data):
+        if external_data_files(encoder_path):
             print("  Embedding encoder weights into .onnx proto...")
             enc = onnx.load(encoder_path, load_external_data=True)
             onnx.save(enc, encoder_path)
-            os.remove(encoder_data)
 
         if args.dtype == "fp16":
             print("\n=== Converting encoder to FP16 ===")
@@ -389,14 +368,12 @@ def main():
         # INT8 / ~1.2 GB FP16 / ~2.4 GB FP32). FP32 exceeds the limit and stays
         # as external data.
         step_path = os.path.join(args.output, "decoder_step.onnx")
-        step_data = step_path + ".data"
-        if os.path.exists(step_data):
+        if external_data_files(step_path):
             step_model = onnx.load(step_path, load_external_data=True)
             proto_size = sum(len(t.raw_data) for t in step_model.graph.initializer)
             if proto_size < 1_800_000_000:  # ~1.8 GB safety margin for protobuf
                 print("  Inlining decoder_step weights into .onnx proto...")
                 onnx.save(step_model, step_path)
-                os.remove(step_data)
                 print(f"  decoder_step.onnx: {os.path.getsize(step_path) / 1e6:.1f} MB (self-contained)")
             else:
                 print(f"  decoder_step too large to inline ({proto_size / 1e6:.0f} MB), keeping external data")

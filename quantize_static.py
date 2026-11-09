@@ -24,8 +24,8 @@ import argparse
 import io
 import json
 import os
-import shutil
 import time
+from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
@@ -39,7 +39,30 @@ from onnxruntime.quantization import (
     quantize_static,
 )
 
-from share_weights import share_external_models
+from share_weights import share_external_models, shared_data_requires_publication
+from src.artifact_metadata import MODEL_METADATA_FILES
+from src.artifact_publication import ArtifactStaging, publish_artifacts
+from src.calibration_cache import (
+    cache_key,
+    file_fingerprints,
+    load_cache,
+    pack_samples,
+    recipe,
+    save_cache,
+    unpack_samples,
+)
+from src.onnx_artifacts import (
+    copy_artifact_entry,
+    graph_file_closure,
+    isolated_onnx_input,
+    preflight_artifact_mutations,
+    prepare_onnx_publication,
+    write_artifact_json,
+)
+from src.tokenizer_assets import (
+    prepare_tokenizer_assets,
+    tokenizer_asset_names,
+)
 
 # ---------------------------------------------------------------------------
 # Calibration data collection
@@ -72,16 +95,11 @@ def collect_calibration_data(
     decoder_init = ort.InferenceSession(os.path.join(model_dir, "decoder_init.onnx"), opts, providers=providers)
     decoder_step = ort.InferenceSession(os.path.join(model_dir, "decoder_step.onnx"), opts, providers=providers)
 
-    # Load embeddings
-    config_path = os.path.join(model_dir, "config.json")
-    with open(config_path) as f:
-        cfg = json.load(f)
-    dtype_str = cfg.get("embed_tokens_dtype", "float32")
-    shape = cfg["embed_tokens_shape"]
-    dtype = np.float16 if dtype_str == "float16" else np.float32
-    embed_tokens = (
-        np.fromfile(os.path.join(model_dir, "embed_tokens.bin"), dtype=dtype).reshape(shape).astype(np.float32)
-    )
+    from src.embeddings import load_embed_tokens
+    from src.prompt import load_prompt_tokenizer
+
+    embed_tokens = load_embed_tokens(model_dir)
+    tokenizer = load_prompt_tokenizer(model_dir)
 
     # Stream calibration audio
     ds = load_dataset(
@@ -125,7 +143,7 @@ def collect_calibration_data(
             if audio_token_count == 0:
                 continue
 
-            prompt_ids = build_prompt_ids(audio_token_count)
+            prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
             input_embeds = embed_tokens[prompt_ids].copy()
             audio_start, audio_end = get_audio_pad_range(prompt_ids)
             input_embeds[audio_start:audio_end] = audio_features[0]
@@ -232,19 +250,20 @@ def quantize_decoder(
         "WeightSymmetric": True,
     }
 
-    quantize_static(
-        input_path,
-        output_path,
-        calibration_data_reader=reader,
-        quant_format=quant_format,
-        activation_type=QuantType.QInt8,
-        weight_type=QuantType.QInt8,
-        per_channel=per_channel,
-        calibrate_method=calibrate_method,
-        nodes_to_exclude=nodes_to_exclude or [],
-        use_external_data_format=True,
-        extra_options=extra_options,
-    )
+    with isolated_onnx_input(input_path) as (staged_model, _stage):
+        quantize_static(
+            str(staged_model),
+            output_path,
+            calibration_data_reader=reader,
+            quant_format=quant_format,
+            activation_type=QuantType.QInt8,
+            weight_type=QuantType.QInt8,
+            per_channel=per_channel,
+            calibrate_method=calibrate_method,
+            nodes_to_exclude=nodes_to_exclude or [],
+            use_external_data_format=True,
+            extra_options=extra_options,
+        )
 
     # Report sizes
     in_size = os.path.getsize(input_path)
@@ -265,6 +284,16 @@ def quantize_decoder(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+
+def calibration_identity(model_dir, n_samples, n_steps):
+    root = Path(model_dir)
+    graphs = {name for name in ("encoder.onnx", "decoder_init.onnx", "decoder_step.onnx") if (root / name).is_file()}
+    names = graph_file_closure(root, graphs) | tokenizer_asset_names(root)
+    names.update(name for name in (*MODEL_METADATA_FILES, "embed_tokens.bin") if (root / name).is_file())
+    return recipe(
+        "static", file_fingerprints(root, names), {"n_samples": n_samples, "n_steps": n_steps}, Path(__file__)
+    )
 
 
 def main():
@@ -325,10 +354,39 @@ def main():
         "--cache-dir",
         type=str,
         default=None,
-        help="Directory to cache/load calibration data (.npz)",
+        help="Directory for provenance-checked numeric calibration caches (.npz)",
     )
     args = parser.parse_args()
+    with prepare_tokenizer_assets(args.input, args.output) as tokenizer:
+        _run_conversion(args, tokenizer)
 
+
+def _run_conversion(args, tokenizer):
+    converted = {
+        f"{stem}.onnx"
+        for stem in ("decoder_init", "decoder_step")
+        if os.path.isfile(os.path.join(args.input, f"{stem}.onnx"))
+    }
+    generated = converted
+    share_pair = {"decoder_init.onnx", "decoder_step.onnx"} <= converted and not args.no_share_weights
+    files = {"embed_tokens.bin", *MODEL_METADATA_FILES}
+    if os.path.isfile(os.path.join(args.input, "encoder.onnx")):
+        files.add("encoder.onnx")
+    tokenizer_files = tokenizer.names if tokenizer else frozenset()
+    files.difference_update(tokenizer_files)
+    original_reads = files | (tokenizer.read_files if tokenizer else set())
+    files = preflight_artifact_mutations(
+        args.input,
+        args.output,
+        files,
+        generated=generated,
+        rewritten={"config.json"},
+        read_files=original_reads,
+        copied_assets=tokenizer_files,
+        asset_source=tokenizer.root if tokenizer else None,
+        removed=tokenizer.removed if tokenizer else (),
+        reads=converted,
+    )
     os.makedirs(args.output, exist_ok=True)
 
     method_map = {
@@ -348,87 +406,90 @@ def main():
     if args.nodes_to_exclude:
         exclude_nodes = [n.strip() for n in args.nodes_to_exclude.split(",")]
 
-    # Collect or load calibration data
     cache_path = None
+    identity = None
+    cached = None
     if args.cache_dir:
-        os.makedirs(args.cache_dir, exist_ok=True)
-        cache_path = os.path.join(args.cache_dir, f"calib_n{args.n_samples}_s{args.n_steps}.npz")
-
-    if cache_path and os.path.exists(cache_path):
-        print(f"Loading cached calibration data from {cache_path}...")
-        data = np.load(cache_path, allow_pickle=True)
-        init_inputs = list(data["init_inputs"])
-        step_inputs = list(data["step_inputs"])
-        print(f"  Loaded {len(init_inputs)} init, {len(step_inputs)} step inputs")
+        identity = calibration_identity(args.input, args.n_samples, args.n_steps)
+        cache_path = Path(args.cache_dir) / f"calib_{cache_key(identity)}.npz"
+        cached = load_cache(cache_path, identity)
+    if cached is not None:
+        groups = unpack_samples(cached, ("init", "step"))
+        init_inputs, step_inputs = groups["init"], groups["step"]
+        print(f"Loaded {len(init_inputs)} init and {len(step_inputs)} step samples from {cache_path}")
     else:
         t0 = time.time()
-        init_inputs, step_inputs = collect_calibration_data(
-            args.input,
-            n_samples=args.n_samples,
-            n_steps=args.n_steps,
-        )
-        elapsed = time.time() - t0
-        print(f"  Calibration data collected in {elapsed:.1f}s")
+        init_inputs, step_inputs = collect_calibration_data(args.input, n_samples=args.n_samples, n_steps=args.n_steps)
+        print(f"Calibration data collected in {time.time() - t0:.1f}s")
+        if cache_path is not None:
+            save_cache(cache_path, identity, pack_samples({"init": init_inputs, "step": step_inputs}))
 
-        if cache_path:
-            np.savez(
-                cache_path,
-                init_inputs=np.array(init_inputs, dtype=object),
-                step_inputs=np.array(step_inputs, dtype=object),
+    with ArtifactStaging(prefix=".static-", dir=args.output) as stage:
+        init_path = os.path.join(args.input, "decoder_init.onnx")
+        if os.path.exists(init_path):
+            quantize_decoder(
+                init_path,
+                str(stage.path / "decoder_init.onnx"),
+                init_inputs,
+                calibrate_method=cal_method,
+                per_channel=args.per_channel,
+                nodes_to_exclude=exclude_nodes,
+                quant_format=quant_fmt,
             )
-            print(f"  Cached to {cache_path}")
 
-    # Quantize decoder_init
-    init_path = os.path.join(args.input, "decoder_init.onnx")
-    if os.path.exists(init_path):
-        quantize_decoder(
-            init_path,
-            os.path.join(args.output, "decoder_init.onnx"),
-            init_inputs,
-            calibrate_method=cal_method,
-            per_channel=args.per_channel,
-            nodes_to_exclude=exclude_nodes,
-            quant_format=quant_fmt,
-        )
+        step_path = os.path.join(args.input, "decoder_step.onnx")
+        if os.path.exists(step_path):
+            quantize_decoder(
+                step_path,
+                str(stage.path / "decoder_step.onnx"),
+                step_inputs,
+                calibrate_method=cal_method,
+                per_channel=args.per_channel,
+                nodes_to_exclude=exclude_nodes,
+                quant_format=quant_fmt,
+            )
 
-    # Quantize decoder_step
-    step_path = os.path.join(args.input, "decoder_step.onnx")
-    if os.path.exists(step_path):
-        quantize_decoder(
-            step_path,
-            os.path.join(args.output, "decoder_step.onnx"),
-            step_inputs,
-            calibrate_method=cal_method,
-            per_channel=args.per_channel,
-            nodes_to_exclude=exclude_nodes,
-            quant_format=quant_fmt,
-        )
-
-    # Share decoder weights
-    if not args.no_share_weights:
-        init_out = os.path.join(args.output, "decoder_init.onnx")
-        step_out = os.path.join(args.output, "decoder_step.onnx")
-        if os.path.exists(init_out) and os.path.exists(step_out):
+        if share_pair:
             print("\nSharing quantized decoder weights...")
-            share_external_models(args.output)
+            share_external_models(stage.path)
+
+        replacements, generated = prepare_onnx_publication(
+            stage.path, args.output, converted, shared_data={"decoder_weights.data"} if share_pair else ()
+        )
+        canonical = Path(args.output) / "decoder_weights.data"
+        if (
+            share_pair
+            and canonical.name in generated
+            and not shared_data_requires_publication(stage.path / canonical.name, canonical)
+        ):
+            generated.remove(canonical.name)
+            replacements = [(source, target) for source, target in replacements if target != canonical]
+        files = preflight_artifact_mutations(
+            args.input,
+            args.output,
+            files,
+            generated=generated,
+            rewritten={"config.json"},
+            read_files=original_reads,
+            copied_assets=tokenizer_files,
+            asset_source=tokenizer.root if tokenizer else None,
+            removed=tokenizer.removed if tokenizer else (),
+            reads=converted,
+        )
+        if replacements:
+            publish_artifacts(replacements)
+        stage.mark_complete()
 
     # Copy encoder and supporting files from input
     print("\nCopying supporting files...")
-    for filename in [
-        "encoder.onnx",
-        "embed_tokens.bin",
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "added_tokens.json",
-        "vocab.json",
-    ]:
+    for filename in sorted(files):
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
-            dst = os.path.join(args.output, filename)
-            if not os.path.exists(dst):
-                shutil.copy2(src, dst)
-                print(f"  Copied {filename}")
+            copy_artifact_entry(args.input, args.output, filename)
+            print(f"  Copied {filename}")
+
+    if tokenizer:
+        tokenizer.publish(written_files=files | generated)
 
     # Update config
     config_path = os.path.join(args.output, "config.json")
@@ -438,8 +499,7 @@ def main():
         config["quantization"] = "int8_static"
         config["calibration_method"] = args.calibrate_method
         config["calibration_samples"] = args.n_samples
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+        write_artifact_json(args.output, "config.json", config)
 
     print(f"\nStatic quantization complete. Output: {args.output}")
     total = 0

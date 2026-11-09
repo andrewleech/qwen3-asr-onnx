@@ -14,7 +14,6 @@ Runs each path on one or more audio files and reports:
 """
 
 import argparse
-import json
 import os
 import time
 
@@ -22,7 +21,6 @@ import numpy as np
 import onnxruntime as ort
 import soundfile as sf
 import torch
-from transformers import AutoTokenizer
 
 # ---------------------------------------------------------------------------
 # Path 1: Native qwen-asr inference
@@ -99,7 +97,7 @@ def run_wrapper_pytorch(model, audio: np.ndarray, tokenizer, device: str = "cpu"
 
     # Build prompt and decode
     audio_token_count = audio_features.shape[1]
-    prompt_ids = build_prompt_ids(audio_token_count)
+    prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
 
     from validate import greedy_decode_pytorch
 
@@ -158,7 +156,7 @@ def run_onnx(sessions, embed_tokens, audio: np.ndarray, tokenizer, label: str) -
 
     # Prompt + decode
     audio_token_count = audio_features.shape[1]
-    prompt_ids = build_prompt_ids(audio_token_count)
+    prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
 
     t0 = time.time()
     tokens = greedy_decode_onnx(sessions, embed_tokens, audio_features, prompt_ids, max_tokens=256)
@@ -294,7 +292,11 @@ def main():
     processor = Qwen3ASRProcessor.from_pretrained(args.model)
 
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    from src.prompt import load_prompt_tokenizer
+
+    tokenizer = load_prompt_tokenizer(args.model)
+    fp32_tokenizer = load_prompt_tokenizer(args.fp32_dir)
+    int8_tokenizer = load_prompt_tokenizer(args.int8_dir)
 
     print("Loading FP32 ONNX sessions...")
     fp32_sessions = load_onnx_sessions(args.fp32_dir)
@@ -304,12 +306,9 @@ def main():
 
     # Load embedding matrices
     def load_embed(onnx_dir):
-        with open(os.path.join(onnx_dir, "config.json")) as f:
-            cfg = json.load(f)
-        dtype = np.dtype(cfg.get("embed_tokens_dtype", "float32"))
-        embed = np.fromfile(os.path.join(onnx_dir, "embed_tokens.bin"), dtype=dtype).reshape(cfg["embed_tokens_shape"])
-        # Always work in float32
-        return embed.astype(np.float32)
+        from src.embeddings import load_embed_tokens
+
+        return load_embed_tokens(onnx_dir)
 
     fp32_embed = load_embed(args.fp32_dir)
     int8_embed = load_embed(args.int8_dir)
@@ -342,11 +341,11 @@ def main():
 
         # Path 3: FP32 ONNX
         print("  Running FP32 ONNX...")
-        results["fp32"] = run_onnx(fp32_sessions, fp32_embed, audio, tokenizer, "FP32")
+        results["fp32"] = run_onnx(fp32_sessions, fp32_embed, audio, fp32_tokenizer, "FP32")
 
         # Path 4: INT8 ONNX
         print("  Running INT8 ONNX...")
-        results["int8"] = run_onnx(int8_sessions, int8_embed, audio, tokenizer, "INT8")
+        results["int8"] = run_onnx(int8_sessions, int8_embed, audio, int8_tokenizer, "INT8")
 
         # --- Report ---
         print("\n--- Transcriptions ---")

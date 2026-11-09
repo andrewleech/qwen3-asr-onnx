@@ -17,3 +17,7 @@ env/
 research_notes.md
 release/
 optimize.log
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

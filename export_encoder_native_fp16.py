@@ -34,6 +34,7 @@ import torch
 from onnx import TensorProto, helper
 
 from src.encoder_wrapper import EncoderWrapper, _get_feat_extract_output_lengths
+from src.onnx_export import export_onnx
 
 
 def _patch_io_to_fp32(model_path, output_dim):
@@ -45,7 +46,7 @@ def _patch_io_to_fp32(model_path, output_dim):
 
     So the encoder is a drop-in replacement for the FP32 version.
     """
-    model = onnx.load(model_path, load_external_data=True)
+    model = onnx.load(model_path, load_external_data=False)
 
     # Rename FP16 mel input → mel_fp16, update all references
     for inp in model.graph.input:
@@ -136,7 +137,7 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     with torch.no_grad(), torch.amp.autocast("cpu", dtype=torch.float16):
-        torch.onnx.export(
+        n = export_onnx(
             wrapper,
             (dummy_mel.half(),),
             args.output,
@@ -145,25 +146,10 @@ def main():
             dynamic_axes={"mel": {2: "time"}, "audio_features": {1: "enc_time"}},
             opset_version=args.opset,
             do_constant_folding=True,
+            postprocess=lambda path: _patch_io_to_fp32(path, output_dim),
         )
 
-    # Fix Reshape allowzero for DirectML compatibility
-    from src.onnx_fixup import fix_reshape_allowzero
-
-    n = fix_reshape_allowzero(args.output)
-    print(f"  Fixed {n} Reshape allowzero attrs")
-
-    # Embed weights into proto (encoder is < 2 GB)
-    data_path = args.output + ".data"
-    if os.path.exists(data_path):
-        print("  Embedding weights into .onnx proto...")
-        enc = onnx.load(args.output, load_external_data=True)
-        onnx.save(enc, args.output)
-        os.remove(data_path)
-
-    # Patch I/O from FP16 to FP32 (drop-in compatible with FP32 encoder)
-    print("  Patching I/O to FP32 (2 Cast nodes at boundary)...")
-    _patch_io_to_fp32(args.output, output_dim)
+    print(f"  Fixed {n} Reshape allowzero attrs; I/O patched to FP32")
 
     size = os.path.getsize(args.output)
     print(f"  File size: {size / 1e6:.1f} MB")

@@ -17,12 +17,23 @@ Usage:
 import argparse
 import json
 import os
-import shutil
+from pathlib import Path
 
 import onnx
 from onnxconverter_common import convert_float_to_float16
 
-from share_weights import share_external_models
+from share_weights import share_external_models, shared_data_requires_publication
+from src.artifact_metadata import MODEL_METADATA_FILES
+from src.artifact_publication import ArtifactStaging, publish_artifacts
+from src.onnx_artifacts import (
+    copy_artifact_entry,
+    preflight_artifact_mutations,
+    prepare_onnx_publication,
+    write_artifact_json,
+)
+from src.tokenizer_assets import (
+    prepare_tokenizer_assets,
+)
 
 
 def convert_model_fp16(input_path: str, output_path: str) -> None:
@@ -75,43 +86,82 @@ def main():
         help="Skip weight sharing for split decoder after conversion",
     )
     args = parser.parse_args()
+    with prepare_tokenizer_assets(args.input, args.output) as tokenizer:
+        _run_conversion(args, tokenizer)
 
+
+def _run_conversion(args, tokenizer):
+    converted = {name for name in args.files if os.path.isfile(os.path.join(args.input, name))}
+    generated = converted
+    share_pair = {"decoder_init.onnx", "decoder_step.onnx"} <= converted and not args.no_share_weights
+    files = {"embed_tokens.bin", *MODEL_METADATA_FILES}
+    if os.path.isfile(os.path.join(args.input, "encoder.onnx")) and "encoder.onnx" not in converted:
+        files.add("encoder.onnx")
+    tokenizer_files = tokenizer.names if tokenizer else frozenset()
+    files.difference_update(tokenizer_files)
+    original_reads = files | (tokenizer.read_files if tokenizer else set())
+    files = preflight_artifact_mutations(
+        args.input,
+        args.output,
+        files,
+        generated=generated,
+        rewritten={"config.json"},
+        read_files=original_reads,
+        copied_assets=tokenizer_files,
+        asset_source=tokenizer.root if tokenizer else None,
+        removed=tokenizer.removed if tokenizer else (),
+        reads=converted,
+    )
     os.makedirs(args.output, exist_ok=True)
 
     print("Converting ONNX files to FP16...")
-    for filename in args.files:
-        input_path = os.path.join(args.input, filename)
-        if not os.path.exists(input_path):
-            print(f"  Skipping {filename} (not found)")
-            continue
-        output_path = os.path.join(args.output, filename)
-        convert_model_fp16(input_path, output_path)
-
-    # Share decoder weights if both init and step were converted
-    if not args.no_share_weights:
-        init_out = os.path.join(args.output, "decoder_init.onnx")
-        step_out = os.path.join(args.output, "decoder_step.onnx")
-        if os.path.exists(init_out) and os.path.exists(step_out):
+    with ArtifactStaging(prefix=".fp16-", dir=args.output) as stage:
+        for filename in args.files:
+            input_path = os.path.join(args.input, filename)
+            if not os.path.exists(input_path):
+                print(f"  Skipping {filename} (not found)")
+                continue
+            convert_model_fp16(input_path, str(stage.path / filename))
+        if share_pair:
             print("\nSharing FP16 decoder weights...")
-            share_external_models(args.output)
+            share_external_models(stage.path)
+        replacements, generated = prepare_onnx_publication(
+            stage.path, args.output, converted, shared_data={"decoder_weights.data"} if share_pair else ()
+        )
+        canonical = Path(args.output) / "decoder_weights.data"
+        if (
+            share_pair
+            and canonical.name in generated
+            and not shared_data_requires_publication(stage.path / canonical.name, canonical)
+        ):
+            generated.remove(canonical.name)
+            replacements = [(source, target) for source, target in replacements if target != canonical]
+        files = preflight_artifact_mutations(
+            args.input,
+            args.output,
+            files,
+            generated=generated,
+            rewritten={"config.json"},
+            read_files=original_reads,
+            copied_assets=tokenizer_files,
+            asset_source=tokenizer.root if tokenizer else None,
+            removed=tokenizer.removed if tokenizer else (),
+            reads=converted,
+        )
+        if replacements:
+            publish_artifacts(replacements)
+        stage.mark_complete()
 
     # Copy non-converted files
     print("\nCopying supporting files...")
-    for filename in [
-        "encoder.onnx",
-        "embed_tokens.bin",
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "added_tokens.json",
-        "vocab.json",
-    ]:
+    for filename in sorted(files):
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
-            dst = os.path.join(args.output, filename)
-            if not os.path.exists(dst):
-                shutil.copy2(src, dst)
-                print(f"  Copied {filename}")
+            copy_artifact_entry(args.input, args.output, filename)
+            print(f"  Copied {filename}")
+
+    if tokenizer:
+        tokenizer.publish(written_files=files | generated)
 
     # Update config
     config_path = os.path.join(args.output, "config.json")
@@ -119,8 +169,7 @@ def main():
         with open(config_path) as f:
             config = json.load(f)
         config["decoder_dtype"] = "float16"
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+        write_artifact_json(args.output, "config.json", config)
         print("  Updated config.json with decoder_dtype=float16")
 
     print(f"\nConversion complete. Output: {args.output}")

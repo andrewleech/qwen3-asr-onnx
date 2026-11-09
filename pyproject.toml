@@ -1,6 +1,42 @@
+[project]
+name = "qwen3-asr-onnx"
+version = "0.1.0"
+description = "Qwen3-ASR ONNX export tools"
+license = "Apache-2.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "torch==2.14.1",
+    "transformers==4.57.6",
+    "qwen-asr==0.0.6",
+    "onnx==1.23.2",
+    "onnxruntime==1.31.0",
+    "onnxscript==0.7.2",
+    "numpy==2.5.4",
+    "librosa==1.0.0",
+    "soundfile==0.14.0",
+    "huggingface-hub==0.36.0",
+    "datasets[audio]>=4,<5",
+    "onnxconverter-common==1.16.0",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "ruff==0.15.8", "mypy==1.19.1"]
+
+[tool.uv]
+package = false
+
 [tool.pytest.ini_options]
+addopts = "-m 'not integration'"
+testpaths = ["tests"]
+filterwarnings = [
+    "error",
+    "ignore:You are using the legacy TorchScript-based ONNX export:DeprecationWarning",
+    "ignore:The feature will be removed.*:DeprecationWarning:torch.onnx._internal.torchscript_exporter.utils",
+    "ignore:invalid escape sequence:SyntaxWarning",
+]
 markers = [
-    "slow: marks tests as slow (run with -m slow)",
+    "slow: long-running model test",
+    "integration: requires full original checkpoints or exported model artifacts",
 ]
 
 [tool.ruff]
@@ -9,16 +45,10 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
-ignore = ["E501", "B905"]  # E501: line length handled by formatter; B905: zip strict= not useful here
+ignore = ["E501", "B905"]
 
 [tool.mypy]
 python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
-
-[dependency-groups]
-dev = [
-    "mypy>=1.19.1",
-    "ruff>=0.15.8",
-]
