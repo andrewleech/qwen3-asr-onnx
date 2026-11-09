@@ -4,7 +4,7 @@ optimize_graphs.py — Apply ORT transformer optimizer to Qwen3-ASR ONNX graphs.
 Applies offline graph fusions that ORT's runtime optimizer does not perform:
 
 - Decoders: Optimizes RMSNorm and serializes standalone normalizations as local ONNX
-  functions with explicit FP32 statistics and scaling in the scale tensor's dtype.
+  functions with explicit FP32 statistics and activation-dtype scaling.
 
 - Encoder: Fuses SkipLayerNormalization (skip-connection + LayerNorm) and BiasGelu
   (bias + GELU). ~4% speedup when int4 decoders make the encoder the bottleneck. ([112])
@@ -21,12 +21,16 @@ Usage:
 """
 
 import argparse
+import gc
 import json
 import math
 import os
 
 import onnx
+from onnxruntime.transformers import optimizer
 from onnxruntime.transformers.optimizer import optimize_model
+
+from src.optimizer_resources import resource_model_type
 
 PROTOBUF_LIMIT = 2 * 1024**3  # 2 GB
 RMS_DOMAIN = "qwen3_asr"
@@ -138,56 +142,65 @@ def optimize_graph(onnx_path: str, num_heads: int, hidden_size: int, use_externa
 
     Skips save if no fusions were applied (avoids unnecessary multi-GB rewrites).
     """
-    basename = os.path.basename(onnx_path)
-    print(f"\nOptimizing {basename}...")
+    model = None
+    model_proto = None
+    failed = False
+    try:
+        model_type = resource_model_type()
+        basename = os.path.basename(onnx_path)
+        print(f"\nOptimizing {basename}...")
 
-    # Count nodes before
-    model_proto = onnx.load(onnx_path, load_external_data=False)
-    nodes_before = len(model_proto.graph.node)
-    del model_proto
+        model_proto = onnx.load(onnx_path, load_external_data=False)
+        nodes_before = len(model_proto.graph.node)
+        model_proto = None
 
-    # Run optimizer
-    model = optimize_model(
-        onnx_path,
-        model_type="gpt2",
-        num_heads=num_heads,
-        hidden_size=hidden_size,
-        opt_level=1,
-    )
+        model = optimize_model(
+            onnx_path,
+            model_type=model_type,
+            optimization_options=optimizer.FusionOptions("gpt2"),
+            num_heads=num_heads,
+            hidden_size=hidden_size,
+            opt_level=1,
+        )
 
-    # Check fusions
-    fusions = model.get_fused_operator_statistics()
-    applied = {op: count for op, count in (fusions or {}).items() if count > 0}
-    portable = _portable_rms_norms(model)
+        fusions = model.get_fused_operator_statistics()
+        applied = {op: count for op, count in (fusions or {}).items() if count > 0}
+        portable = _portable_rms_norms(model)
 
-    if not applied and not portable:
-        print("  No fusions applied, skipping save")
-        return
+        if not applied and not portable:
+            print("  No fusions applied, skipping save")
+            return
 
-    print("  Fusions applied:")
-    for op_type, count in sorted(applied.items()):
-        print(f"    {op_type}: {count}")
-    if portable:
-        print(f"  Portable RMS normalization functions: {portable}")
+        print("  Fusions applied:")
+        for op_type, count in sorted(applied.items()):
+            print(f"    {op_type}: {count}")
+        if portable:
+            print(f"  Portable RMS normalization functions: {portable}")
 
-    # Check protobuf size limit for inlined models
-    if not use_external_data:
-        estimated_size = model.model.ByteSize()
-        if estimated_size > PROTOBUF_LIMIT * 0.85:
-            print(
-                f"  WARNING: Model size {estimated_size / 1024**3:.2f} GB "
-                f"is close to 2 GB protobuf limit. Consider external data."
-            )
+        if not use_external_data:
+            estimated_size = model.model.ByteSize()
+            if estimated_size > PROTOBUF_LIMIT * 0.85:
+                print(
+                    f"  WARNING: Model size {estimated_size / 1024**3:.2f} GB "
+                    f"is close to 2 GB protobuf limit. Consider external data."
+                )
 
-    # Save back (overwrites original)
-    model.save_model_to_file(onnx_path, use_external_data_format=use_external_data)
-    onnx.checker.check_model(onnx_path)
+        model.save_model_to_file(onnx_path, use_external_data_format=use_external_data)
+        onnx.checker.check_model(onnx_path)
 
-    # Report node reduction (use optimizer's in-memory model, avoid extra disk load)
-    nodes_after = len(model.model.graph.node)
-    reduction = nodes_before - nodes_after
-    pct = (reduction / nodes_before * 100) if nodes_before > 0 else 0
-    print(f"  Nodes: {nodes_before} -> {nodes_after} ({reduction} removed, {pct:.1f}% reduction)")
+        # Report node reduction (use optimizer's in-memory model, avoid extra disk load)
+        nodes_after = len(model.model.graph.node)
+        reduction = nodes_before - nodes_after
+        pct = (reduction / nodes_before * 100) if nodes_before > 0 else 0
+        print(f"  Nodes: {nodes_before} -> {nodes_after} ({reduction} removed, {pct:.1f}% reduction)")
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        if not failed:
+            model = None
+            del model_proto
+        gc.collect()
 
 
 def main():

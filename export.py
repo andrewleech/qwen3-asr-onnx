@@ -18,14 +18,17 @@ Usage:
 import argparse
 import json
 import os
+from pathlib import Path
 
 import onnx
 import torch
 from transformers import AutoModel
 
+from src.artifact_publication import ArtifactStaging
+from src.artifact_sources import validate_publication_sources
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
-from src.onnx_artifacts import external_data_files
+from src.onnx_artifacts import external_data_files, preflight_artifact_mutations, write_artifact_json
 from src.prompt import (
     ASR_TEXT_TOKEN_ID,
     AUDIO_END_TOKEN_ID,
@@ -35,10 +38,16 @@ from src.prompt import (
     EOS_TOKEN_IDS,
     IM_END_TOKEN_ID,
     IM_START_TOKEN_ID,
-    build_prompt_ids,
     load_prompt_tokenizer,
+    validate_prompt_tokenizer,
 )
-from src.tokenizer_assets import validate_tokenizer_assets
+from src.tokenizer_assets import (
+    TOKENIZER_FILES,
+    copy_tokenizer_assets,
+    tokenizer_checkpoint_reads,
+    validate_tokenizer_assets,
+    validate_tokenizer_destination,
+)
 
 
 def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
@@ -78,67 +87,24 @@ def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
 
 
 def copy_tokenizer(model_id: str, output_dir: str):
-    """Copy tokenizer.json from the HuggingFace model."""
-    if os.path.lexists(os.path.join(output_dir, "chat_template.json")):
-        raise ValueError("Output contains chat_template.json; use a clean output directory")
+    validate_tokenizer_destination(output_dir)
     tokenizer = load_prompt_tokenizer(model_id)
-
-    # Save tokenizer files
+    validate_publication_sources(
+        tokenizer_checkpoint_reads(model_id, tokenizer),
+        files=(Path(output_dir) / name for name in TOKENIZER_FILES),
+    )
     tokenizer.chat_template = tokenizer.get_chat_template()
-    tokenizer.save_pretrained(output_dir)
-
-    # Remove unwanted files from save_pretrained, keep only tokenizer files
-    keep_files = {"tokenizer.json", "tokenizer_config.json", "chat_template.jinja"}
-    remove_extensions = {".py", ".txt"}
-    for f in os.listdir(output_dir):
-        if f in keep_files:
-            continue
-        path = os.path.join(output_dir, f)
-        _, ext = os.path.splitext(f)
-        if ext in remove_extensions or f == "special_tokens_map.json":
-            os.remove(path)
-
-    validate_tokenizer_assets(output_dir)
+    with ArtifactStaging(prefix="qwen-tokenizer-export-", dir=None) as staging:
+        tokenizer.save_pretrained(staging.path)
+        validate_tokenizer_assets(staging.path)
+        copy_tokenizer_assets(staging.path, output_dir)
+        staging.mark_complete()
     print(f"Tokenizer saved to {output_dir}")
 
 
 def verify_special_tokens(model_id: str):
-    """
-    Verify special token IDs match our constants.
-
-    Loads the tokenizer and checks that the token IDs we hardcoded
-    in prompt.py match the actual tokenizer.
-    """
     tokenizer = load_prompt_tokenizer(model_id)
-
-    checks = {
-        "<|audio_start|>": AUDIO_START_TOKEN_ID,
-        "<|audio_end|>": AUDIO_END_TOKEN_ID,
-        "<|audio_pad|>": AUDIO_PAD_TOKEN_ID,
-        "<|im_start|>": IM_START_TOKEN_ID,
-        "<|im_end|>": IM_END_TOKEN_ID,
-        "<|endoftext|>": ENDOFTEXT_TOKEN_ID,
-        "<asr_text>": ASR_TEXT_TOKEN_ID,
-    }
-
-    all_ok = True
-    for token_str, expected_id in checks.items():
-        actual_id = tokenizer.convert_tokens_to_ids(token_str)
-        if actual_id != expected_id:
-            print(f"  MISMATCH: {token_str} expected={expected_id} actual={actual_id}")
-            all_ok = False
-        else:
-            print(f"  OK: {token_str} = {actual_id}")
-
-    if not all_ok:
-        raise ValueError("Special token IDs do not match. Update src/prompt.py with correct values.")
-    expected_text = (
-        "<|im_start|>system\n<|im_end|>\n"
-        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
-    if build_prompt_ids(1, tokenizer) != tokenizer.encode(expected_text, add_special_tokens=False):
-        raise ValueError("Chat template role names or structure do not match Qwen3-ASR")
+    validate_prompt_tokenizer(tokenizer)
     print("All special token IDs and prompt roles verified.")
 
 
@@ -171,8 +137,9 @@ def write_preprocessor_config(output_dir: str):
     }
 
     output_path = os.path.join(output_dir, "preprocessor_config.json")
-    with open(output_path, "w") as f:
-        json.dump(config, f, indent=2)
+    root = Path(output_dir).resolve()
+    preflight_artifact_mutations(root, root, (), rewritten={"preprocessor_config.json"})
+    write_artifact_json(output_dir, "preprocessor_config.json", config)
     print(f"Preprocessor config saved to {output_path}")
 
 
@@ -340,6 +307,7 @@ def main():
     if args.output is None:
         args.output = _default_output_dir(args.model)
 
+    validate_tokenizer_destination(args.output)
     os.makedirs(args.output, exist_ok=True)
 
     # Always load in FP32 initially — encoder needs FP32 for mel spectrogram input.
@@ -363,7 +331,6 @@ def main():
             opset_version=args.opset,
             device=args.device,
         )
-        # The supported encoders fit in one protobuf; raw storage may also serve retained graphs.
         if external_data_files(encoder_path):
             print("  Embedding encoder weights into .onnx proto...")
             enc = onnx.load(encoder_path, load_external_data=True)

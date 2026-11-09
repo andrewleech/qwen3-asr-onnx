@@ -1,3 +1,4 @@
+import hashlib
 import json
 from numbers import Integral
 
@@ -10,6 +11,32 @@ AUDIO_PAD_TOKEN_ID = 151676
 ASR_TEXT_TOKEN_ID = 151704
 EOS_TOKEN_IDS = [ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID]
 NEWLINE_TOKEN_ID = 198
+
+
+def tokenizer_fingerprint(tokenizer):
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        raise ValueError("Tokenizer identity requires a serializable fast tokenizer backend")
+    value = {
+        "class": [type(tokenizer).__module__, type(tokenizer).__qualname__],
+        "backend": json.loads(backend.to_str()),
+        "template": tokenizer.get_chat_template(),
+        "special_tokens": tokenizer.special_tokens_map,
+        "settings": {
+            name: getattr(tokenizer, name, None)
+            for name in (
+                "padding_side",
+                "truncation_side",
+                "model_max_length",
+                "split_special_tokens",
+                "add_bos_token",
+                "add_eos_token",
+            )
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
 
 
 def load_prompt_tokenizer(model_id: str, *, local_files_only: bool = False):

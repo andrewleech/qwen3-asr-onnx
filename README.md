@@ -107,9 +107,10 @@ RTF measured on Ryzen AI 7 PRO 350 (native Windows, ORT 2.0 rc12). WER from 200-
 ## Setup
 
 ```bash
+uv sync --locked --python 3.12.13
+uv run pytest -q
+# pip alternative (runtime dependencies; use Python 3.12):
 pip install -r requirements.txt
-# or with uv:
-uv sync
 ```
 
 ## Pipeline
@@ -143,14 +144,17 @@ python optimize_graphs.py --input output/qwen3-asr-1.7b
 ```
 
 Applies ORT transformer optimizer fusions that the runtime optimizer does not perform:
-- **Decoders:** Fuses decomposed RMSNorm into `SimplifiedLayerNormalization` — 7% speedup on FP32, 4% on int4 ([111], [113])
+- **Decoders:** Retains supported skip-RMS fusions. Standalone RMSNorm uses a model-local ONNX function with FP32 normalization followed by scale/output-dtype scaling. This avoids serializing ORT's unregistered default-domain `SimplifiedLayerNormalization` and preserves the graph's existing opset.
 - **Encoder:** Fuses `SkipLayerNormalization` (skip-connection + LayerNorm) and `BiasGelu` — ~4% speedup when int4 decoders make the encoder the bottleneck ([112])
 
-Must be applied to FP32 graphs before quantization so that int4 weights are calibrated against the fused kernels ([113]).
+Apply optimization to FP32 graphs before quantization. The saved graphs must pass the ONNX checker. Historical decoder fusion speedups do not establish the performance of the portable function; measure the resulting exports.
 
 ### 4. int4 MatMulNBits Quantization (recommended for both 0.6B and 1.7B)
 
-`quantize_nbits.py` applies ORT's `MatMulNBitsQuantizer` to the decoder files. The encoder uses a native FP16 export (half the size of FP32, zero WER impact).
+`quantize_nbits.py` applies ORT's `MatMulNBitsQuantizer` to the decoder files.
+The supported ORT 1.31.0 RTN/GPTQ paths emit 4-bit weights. Both reject `--bits 8`
+before creating outputs. Node exclusions are supported by RTN; GPTQ rejects
+exclusions explicitly. Every emitted quantized operator is checked before saving. The encoder uses a native FP16 export (half the size of FP32, zero WER impact).
 
 ```bash
 # RTN (no calibration data, fast — adds .int4 files alongside FP32):
@@ -181,7 +185,7 @@ INT8 AWQ is not published to HuggingFace but can be built locally for a smaller-
 # Collect calibration activations, smooth weights, re-export FP32 ONNX
 python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
     --output output/qwen3-asr-0.6b-smooth \
-    --alpha 0.2 --n-samples 128 --verify
+    --alpha 0.2 --n-samples 128 --device cpu --verify
 
 # Quantize the smoothed model to INT8 (adds .int8 files alongside FP32)
 python quantize.py \
@@ -189,13 +193,12 @@ python quantize.py \
     --output output/qwen3-asr-0.6b
 ```
 
-The existing 0.6B recipe uses alpha 0.2. Calibration data must be collected with the current model and prompt contract. Existing caches have no verified provenance and are preserved and rejected. Choose a clean output or cache path for each run; alpha sweeps currently require fresh collection.
+α=0.2 is the optimal smoothing strength for 0.6B INT8. Calibration activations are cached in the smooth output directory as `calibration_activations_<identity>.npz`. To sweep alpha values without re-collecting, keep the same model, output directory, sample count and device; only change alpha. The default cache key excludes alpha and verifies the checkpoint, tokenizer and collection recipe:
 
 ```bash
 python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
-    --output output/qwen3-asr-0.6b-smooth-alpha-02 \
-    --alpha 0.2 --n-samples 128 \
-    --activations-cache output/qwen3-asr-0.6b-smooth-alpha-02/fresh-calibration.npz
+    --output output/qwen3-asr-0.6b-smooth \
+    --n-samples 128 --device cpu --alpha 0.4
 ```
 
 ### Evaluate WER
@@ -234,7 +237,7 @@ uv run python validate.py \
     --onnx-dir output/qwen3-asr-0.6b \
     --audio tests/fixtures/test_audio.wav
 
-# Optimize encoder + decoders (fuses RMSNorm, SkipLayerNorm, BiasGelu — 4-7% speedup)
+# Optimize and validate encoder and decoder graphs
 uv run python optimize_graphs.py --input output/qwen3-asr-0.6b
 
 # int4 RTN al4 decoders (recommended)
@@ -261,7 +264,7 @@ uv run python validate.py \
     --onnx-dir output/qwen3-asr-1.7b \
     --audio tests/fixtures/test_audio.wav
 
-# Optimize encoder + decoders (fuses RMSNorm, SkipLayerNorm, BiasGelu — 4-7% speedup)
+# Optimize and validate encoder and decoder graphs
 uv run python optimize_graphs.py --input output/qwen3-asr-1.7b
 
 # int4 RTN al4 decoders (same as 0.6B — GPTQ provides no WER benefit, see experiment [109])
@@ -346,6 +349,10 @@ output/
 
 Each model directory is self-contained. For distribution, the int4 variant files are: `encoder.int4.onnx` + `decoder_init.int4.onnx` + `decoder_step.int4.onnx` + `decoder_weights.int4.data` + `embed_tokens.bin` (FP16) + `config.json` + `tokenizer.json`. The FP32 files are optional extras for users who need maximum accuracy.
 
+Tokenizer artifacts use the canonical fast backend in `tokenizer.json`. Packaging and conversion reject metadata that overrides constructor file paths, selects another versioned backend, or enables alternate tokenizer construction. A version list that selects the canonical backend is allowed. Export can normalize ordinary split-vocabulary checkpoints and HuggingFace cache links; it rejects unsupported backend overrides. Tokenizer-family publication checks the original checkpoint's tokenizer access paths before replacing or removing supported tokenizer-family assets.
+
+Tokenizer transport prepares an independent family before conversion starts. Families that depend on model configuration are serialized with their resolved class, backend, settings and templates, without replacing converter-owned model metadata. The original processor template is preserved separately, including its default and named templates, while the tokenizer retains its complete template collection. Embedded-only input gains a standalone processor template; packaging and direct archiving use the same prepared family. In-place completion adds only a missing companion and preserves existing files. Any deferred regex correction is disabled after the source-selected backend is serialized, so another model config cannot change it later. Conflict checks use the actual prepared bytes, so retained graph storage is preserved and identical bytes can be reused.
+
 ## Architecture
 
 - **Encoder**: mel `[1, 128, T]` → windowed Conv2D (100-frame windows, 3x stride-2 convs producing 13 tokens per window) → windowed attention (104-token windows across transformer layers) → MLP projection → `[1, N, output_dim]` where `N = get_feat_extract_output_lengths(T)`. 0.6B: 18 layers, d=896, output_dim=1024. 1.7B: 24 layers, d=1024, output_dim=2048.
@@ -393,7 +400,9 @@ Note: DirectML produces incorrect output on AMD Radeon iGPUs (tested on 860M). N
 ## Tests
 
 ```bash
-python -m pytest tests/
+uv run --locked pytest -q
+# Full original-checkpoint encoder validation:
+uv run --locked pytest -m integration tests/full/test_checkpoint_encoder.py -s
 ```
 
 Audio fixtures in `tests/fixtures/` are tracked with Git LFS. Run `git lfs pull` after cloning to fetch them. See `tests/fixtures/README.md` for provenance.

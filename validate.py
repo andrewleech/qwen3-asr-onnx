@@ -214,6 +214,8 @@ def validate_encoder(model, sessions, mel_np, mel_torch, device, *, atol=1e-4, r
         native_features = run_native_encoder(model.thinker.audio_tower, mel_torch).cpu().numpy()
     pt_features = run_encoder_pytorch(model, mel_torch).cpu().numpy()
     onnx_features = run_encoder_onnx(sessions["encoder"], mel_np)
+    if onnx_features.dtype != np.dtype(np.float32):
+        raise ValueError(f"ONNX encoder output dtype must be float32, got {onnx_features.dtype}")
     compare_features(native_features, pt_features, "native vs wrapper", atol=atol, rtol=rtol)
     compare_features(pt_features, onnx_features, "wrapper vs ONNX", atol=atol, rtol=rtol)
     compare_features(native_features, onnx_features, "native vs ONNX", atol=atol, rtol=rtol)

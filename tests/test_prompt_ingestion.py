@@ -10,20 +10,8 @@ from onnx import helper, numpy_helper
 import awq_smooth
 import collect_gptq_calib
 from src import prompt
+from tests.artifact_fixtures import _release_input
 from tests.tokenizer_fixtures import OFFICIAL_CHAT_TEMPLATE, save_tokenizer_assets
-
-
-def _calibration_source(root):
-    save_tokenizer_assets(root)
-    vocab_size = max(prompt.AUDIO_PAD_TOKEN_ID, prompt.ASR_TEXT_TOKEN_ID) + 1
-    config = {
-        "decoder": {"vocab_size": vocab_size, "hidden_size": 4},
-        "embed_tokens_shape": [vocab_size, 4],
-        "embed_tokens_dtype": "float32",
-    }
-    (root / "config.json").write_text(json.dumps(config))
-    np.zeros((vocab_size, 4), dtype=np.float32).tofile(root / "embed_tokens.bin")
-    return root
 
 
 def _change_template(root, representation, template):
@@ -50,7 +38,7 @@ def test_loader_rejects_incorrect_roles_with_valid_audio(tmp_path, representatio
 
 
 def test_calibration_rejects_bad_roles_without_replacing_prior_data(tmp_path, monkeypatch):
-    source = _calibration_source(tmp_path / "model")
+    source = _release_input(tmp_path / "model")
     features = numpy_helper.from_array(np.ones((1, 1, 4), dtype=np.float32))
     graph = helper.make_graph(
         [helper.make_node("Constant", [], ["audio_features"], value=features)],
@@ -101,19 +89,7 @@ def test_awq_rejects_bad_roles_before_calibration_persistence(tmp_path, monkeypa
     cache = output / "calibration_activations.npz"
     cache.write_bytes(b"retained activation cache")
     monkeypatch.setattr(awq_smooth, "load_model", lambda *args, **kwargs: SimpleNamespace())
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "awq_smooth.py",
-            "--model",
-            str(source),
-            "--output",
-            str(output),
-            "--activations-cache",
-            str(output / "fresh.npz"),
-        ],
-    )
+    monkeypatch.setattr(sys, "argv", ["awq_smooth.py", "--model", str(source), "--output", str(output)])
     with pytest.raises(ValueError, match="prompt contract"):
         awq_smooth.main()
     assert cache.read_bytes() == b"retained activation cache"

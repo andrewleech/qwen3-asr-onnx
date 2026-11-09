@@ -22,6 +22,39 @@ def assert_features_match(actual, expected):
     assert relative_l2 < 1e-5
 
 
+def test_validator_rejects_real_double_encoder_output(tmp_path, native_tower):
+    import onnx
+
+    from validate import FiniteOutputSession, validate_encoder
+
+    path = tmp_path / "encoder.onnx"
+    export_encoder_at_100(EncoderWrapper(native_tower).eval(), path)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    mel = torch.randn(1, 128, 7, generator=torch.Generator().manual_seed(7))
+    owner = SimpleNamespace(thinker=SimpleNamespace(audio_tower=native_tower))
+    session = FiniteOutputSession(
+        ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"]), "encoder"
+    )
+    validate_encoder(owner, {"encoder": session}, mel.numpy(), mel, "cpu")
+    model = onnx.load(path, load_external_data=True)
+    output = model.graph.output[0]
+    name = output.name
+    for node in model.graph.node:
+        for index, value in enumerate(node.output):
+            if value == name:
+                node.output[index] = f"{name}_fp32"
+    model.graph.node.append(onnx.helper.make_node("Cast", [f"{name}_fp32"], [name], to=onnx.TensorProto.DOUBLE))
+    output.type.tensor_type.elem_type = onnx.TensorProto.DOUBLE
+    onnx.save(model, path)
+    session = FiniteOutputSession(
+        ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"]), "encoder"
+    )
+    with pytest.raises(ValueError, match="encoder output dtype"):
+        validate_encoder(owner, {"encoder": session}, mel.numpy(), mel, "cpu")
+
+
 @pytest.fixture(scope="module", autouse=True)
 def encoder_threads():
     previous = torch.get_num_threads()
